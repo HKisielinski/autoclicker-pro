@@ -38,6 +38,9 @@ namespace AutoClickerApp
         static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
 
         [DllImport("user32.dll", SetLastError = true)]
+        static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
@@ -47,7 +50,14 @@ namespace AutoClickerApp
         [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
         static extern IntPtr GetModuleHandle(string lpModuleName);
 
+        [DllImport("user32.dll")]
+        static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
         delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+        delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential)]
         struct POINTAPI { public int x; public int y; }
@@ -62,12 +72,34 @@ namespace AutoClickerApp
             public IntPtr dwExtraInfo;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        // A single recorded step: either a click at a screen position, or a key press.
+        struct SequenceStep
+        {
+            public bool IsKey;
+            public Point Position;
+            public Keys Key;
+
+            public static SequenceStep ForClick(Point p) { return new SequenceStep { IsKey = false, Position = p }; }
+            public static SequenceStep ForKey(Keys k) { return new SequenceStep { IsKey = true, Key = k }; }
+        }
+
         const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
         const uint MOUSEEVENTF_LEFTUP = 0x0004;
         const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
         const uint MOUSEEVENTF_RIGHTUP = 0x0010;
         const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
         const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+        const uint KEYEVENTF_KEYUP = 0x0002;
 
         const int WM_HOTKEY = 0x0312;
         const int HOTKEY_ID = 1;
@@ -76,7 +108,10 @@ namespace AutoClickerApp
         const uint VK_F7 = 0x76;
 
         const int WH_MOUSE_LL = 14;
+        const int WH_KEYBOARD_LL = 13;
         const int WM_LBUTTONDOWN_HOOK = 0x0201;
+        const int WM_KEYDOWN_HOOK = 0x0100;
+        const int WM_SYSKEYDOWN_HOOK = 0x0104;
 
         // --- Licensing (Gumroad) ---
         // TODO before shipping: replace both constants below.
@@ -92,7 +127,7 @@ namespace AutoClickerApp
         const int TRIAL_CLICK_LIMIT = 100;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.0.1";
+        const string APP_VERSION = "1.0.2";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -107,6 +142,8 @@ namespace AutoClickerApp
 
         // --- UI controls ---
         NumericUpDown numHours, numMinutes, numSeconds, numMillis;
+        CheckBox chkRandomize;
+        NumericUpDown numRandomMs;
         RadioButton radCurrentPos, radFixedPos, radSequence;
         NumericUpDown numX, numY;
         Button btnPickPos;
@@ -123,10 +160,12 @@ namespace AutoClickerApp
         Timer clickTimer;
         Timer pickCountdownTimer;
 
-        List<Point> sequence = new List<Point>();
+        List<SequenceStep> sequence = new List<SequenceStep>();
         int seqPlayIndex = 0;
+        long baseIntervalMs;
+        readonly Random rng = new Random();
 
-        Dictionary<string, List<Point>> savedSequences = new Dictionary<string, List<Point>>();
+        Dictionary<string, List<SequenceStep>> savedSequences = new Dictionary<string, List<SequenceStep>>();
         readonly string saveDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClickerPro");
         string SaveFile { get { return Path.Combine(saveDir, "sequences.txt"); } }
         string LicenseFile { get { return Path.Combine(saveDir, "license.txt"); } }
@@ -145,6 +184,8 @@ namespace AutoClickerApp
         bool isRecording = false;
         IntPtr recordHookId = IntPtr.Zero;
         LowLevelMouseProc recordHookProc;
+        IntPtr recordKeyHookId = IntPtr.Zero;
+        LowLevelKeyboardProc recordKeyHookProc;
 
         public MainForm()
         {
@@ -153,7 +194,7 @@ namespace AutoClickerApp
             MaximizeBox = false;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(340, 1000);
+            ClientSize = new Size(340, 1030);
             Font = new Font("Segoe UI", 9F);
 
             try
@@ -266,7 +307,7 @@ namespace AutoClickerApp
             Controls.Add(grpLicense);
             y += 115;
 
-            var grpInterval = new GroupBox { Text = "Click Interval", Left = 10, Top = y, Width = 310, Height = 70 };
+            var grpInterval = new GroupBox { Text = "Click Interval", Left = 10, Top = y, Width = 310, Height = 100 };
             numHours = new NumericUpDown { Left = 10, Top = 25, Width = 55, Maximum = 23 };
             numMinutes = new NumericUpDown { Left = 80, Top = 25, Width = 55, Maximum = 59 };
             numSeconds = new NumericUpDown { Left = 150, Top = 25, Width = 55, Maximum = 59, Value = 1 };
@@ -279,8 +320,14 @@ namespace AutoClickerApp
             grpInterval.Controls.Add(numMinutes);
             grpInterval.Controls.Add(numSeconds);
             grpInterval.Controls.Add(numMillis);
+            chkRandomize = new CheckBox { Text = "Randomize interval, ±", Left = 10, Top = 72, Width = 160 };
+            numRandomMs = new NumericUpDown { Left = 172, Top = 70, Width = 70, Maximum = 60000, Enabled = false };
+            chkRandomize.CheckedChanged += (s, e) => { numRandomMs.Enabled = chkRandomize.Checked; };
+            grpInterval.Controls.Add(chkRandomize);
+            grpInterval.Controls.Add(numRandomMs);
+            grpInterval.Controls.Add(new Label { Text = "ms", Left = 248, Top = 72, Width = 40, TextAlign = ContentAlignment.MiddleLeft });
             Controls.Add(grpInterval);
-            y += 80;
+            y += 110;
 
             var grpPos = new GroupBox { Text = "Click Position", Left = 10, Top = y, Width = 310, Height = 140 };
             radCurrentPos = new RadioButton { Text = "Current cursor position", Left = 10, Top = 20, Width = 250, Checked = true };
@@ -299,14 +346,14 @@ namespace AutoClickerApp
             Controls.Add(grpPos);
             y += 150;
 
-            var grpSeq = new GroupBox { Text = "Position list (clicked in this order, looped)", Left = 10, Top = y, Width = 310, Height = 195 };
+            var grpSeq = new GroupBox { Text = "Steps: clicks + key presses (in this order, looped)", Left = 10, Top = y, Width = 310, Height = 195 };
             lstSequence = new ListBox { Left = 10, Top = 20, Width = 290, Height = 80 };
             btnAddSeq = new Button { Text = "Add position (3s)", Left = 10, Top = 105, Width = 140, Tag = "Add position (3s)" };
             btnRemoveSeq = new Button { Text = "Remove selected", Left = 160, Top = 105, Width = 140 };
             btnSeqUp = new Button { Text = "▲ Move up", Left = 10, Top = 132, Width = 90 };
             btnSeqDown = new Button { Text = "▼ Move down", Left = 110, Top = 132, Width = 90 };
             btnClearSeq = new Button { Text = "Clear", Left = 210, Top = 132, Width = 90 };
-            btnRecord = new Button { Text = "🔴 Record clicks (F7)", Left = 10, Top = 161, Width = 290, Height = 26, Tag = "🔴 Record clicks (F7)" };
+            btnRecord = new Button { Text = "🔴 Record clicks + keys (F7)", Left = 10, Top = 161, Width = 290, Height = 26, Tag = "🔴 Record clicks + keys (F7)" };
             btnAddSeq.Click += (s, e) => StartPick(1, btnAddSeq);
             btnRemoveSeq.Click += BtnRemoveSeq_Click;
             btnSeqUp.Click += (s, e) => MoveSelected(-1);
@@ -382,14 +429,14 @@ namespace AutoClickerApp
             Controls.Add(lblStatus);
             y += 20;
 
-            lblCount = new Label { Text = "Clicks performed: 0", Left = 10, Top = y, Width = 310, TextAlign = ContentAlignment.MiddleCenter };
+            lblCount = new Label { Text = "Actions performed: 0", Left = 10, Top = y, Width = 310, TextAlign = ContentAlignment.MiddleCenter };
             Controls.Add(lblCount);
             y += 20;
 
-            lblHotkeyInfo = new Label { Text = "F6 = start/stop clicking, F7 = start/stop recording (global). Closing the window (X) minimizes it to the system tray — right-click the tray icon to exit for good.", Left = 10, Top = y, Width = 310, Height = 55, ForeColor = Color.Gray, TextAlign = ContentAlignment.MiddleCenter };
+            lblHotkeyInfo = new Label { Text = "F6 = start/stop clicking, F7 = start/stop recording clicks + key presses (global). Closing the window (X) minimizes it to the system tray — right-click the tray icon to exit for good.", Left = 10, Top = y, Width = 310, Height = 55, ForeColor = Color.Gray, TextAlign = ContentAlignment.MiddleCenter };
             Controls.Add(lblHotkeyInfo);
 
-            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 960, Width = 310, Height = 28 };
+            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 990, Width = 310, Height = 28 };
             btnCheckUpdate.Click += BtnCheckUpdate_Click;
             Controls.Add(btnCheckUpdate);
         }
@@ -400,7 +447,13 @@ namespace AutoClickerApp
         {
             lstSequence.Items.Clear();
             for (int i = 0; i < sequence.Count; i++)
-                lstSequence.Items.Add(string.Format("{0}. ({1}, {2})", i + 1, sequence[i].X, sequence[i].Y));
+            {
+                var step = sequence[i];
+                string desc = step.IsKey
+                    ? string.Format("{0}. Key: {1}", i + 1, step.Key)
+                    : string.Format("{0}. Click ({1}, {2})", i + 1, step.Position.X, step.Position.Y);
+                lstSequence.Items.Add(desc);
+            }
         }
 
         void BtnRemoveSeq_Click(object sender, EventArgs e)
@@ -417,7 +470,7 @@ namespace AutoClickerApp
             int idx = lstSequence.SelectedIndex;
             int newIdx = idx + dir;
             if (idx < 0 || newIdx < 0 || newIdx >= sequence.Count) return;
-            Point tmp = sequence[idx];
+            SequenceStep tmp = sequence[idx];
             sequence[idx] = sequence[newIdx];
             sequence[newIdx] = tmp;
             RefreshSequenceList();
@@ -449,7 +502,7 @@ namespace AutoClickerApp
                 }
                 else
                 {
-                    sequence.Add(p);
+                    sequence.Add(SequenceStep.ForClick(p));
                     RefreshSequenceList();
                 }
                 activePickButton.Text = (string)activePickButton.Tag;
@@ -481,11 +534,14 @@ namespace AutoClickerApp
             radSequence.Checked = true;
             isRecording = true;
             btnRecord.Text = "⏹ Stop recording (F7) — 0";
-            lblStatus.Text = "Status: RECORDING — click in your target app (left button)";
+            lblStatus.Text = "Status: RECORDING — click, or press keys, in your target app";
             lblStatus.ForeColor = Color.Red;
 
             recordHookProc = RecordHookCallback;
             recordHookId = SetWindowsHookEx(WH_MOUSE_LL, recordHookProc, GetModuleHandle(null), 0);
+
+            recordKeyHookProc = RecordKeyHookCallback;
+            recordKeyHookId = SetWindowsHookEx(WH_KEYBOARD_LL, recordKeyHookProc, GetModuleHandle(null), 0);
         }
 
         void StopRecording()
@@ -495,6 +551,11 @@ namespace AutoClickerApp
             {
                 UnhookWindowsHookEx(recordHookId);
                 recordHookId = IntPtr.Zero;
+            }
+            if (recordKeyHookId != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(recordKeyHookId);
+                recordKeyHookId = IntPtr.Zero;
             }
             btnRecord.Text = (string)btnRecord.Tag;
             lblStatus.Text = "Status: stopped";
@@ -510,13 +571,35 @@ namespace AutoClickerApp
 
                 if (!Bounds.Contains(pt))
                 {
-                    sequence.Add(pt);
+                    sequence.Add(SequenceStep.ForClick(pt));
                     RefreshSequenceList();
                     lstSequence.TopIndex = Math.Max(0, lstSequence.Items.Count - 1);
                     btnRecord.Text = "⏹ Stop recording (F7) — " + sequence.Count;
                 }
             }
             return CallNextHookEx(recordHookId, nCode, wParam, lParam);
+        }
+
+        // Records key presses typed into the target app while recording, so a sequence can
+        // interleave clicks and keys (e.g. click, type "r", click, type "a"). Keys pressed while
+        // this app itself is focused (including F6/F7) are ignored - only presses sent to
+        // whatever window the user is actually recording into count as steps.
+        IntPtr RecordKeyHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && (wParam.ToInt32() == WM_KEYDOWN_HOOK || wParam.ToInt32() == WM_SYSKEYDOWN_HOOK))
+            {
+                KBDLLHOOKSTRUCT hookStruct = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                uint vk = hookStruct.vkCode;
+
+                if (vk != VK_F6 && vk != VK_F7 && GetForegroundWindow() != Handle)
+                {
+                    sequence.Add(SequenceStep.ForKey((Keys)vk));
+                    RefreshSequenceList();
+                    lstSequence.TopIndex = Math.Max(0, lstSequence.Items.Count - 1);
+                    btnRecord.Text = "⏹ Stop recording (F7) — " + sequence.Count;
+                }
+            }
+            return CallNextHookEx(recordKeyHookId, nCode, wParam, lParam);
         }
 
         // --- Sequence: save / load named presets ---
@@ -545,7 +628,7 @@ namespace AutoClickerApp
             name = (name ?? "").Trim();
             if (name.Length == 0) return;
 
-            savedSequences[name] = new List<Point>(sequence);
+            savedSequences[name] = new List<SequenceStep>(sequence);
             SaveAllToFile();
             RefreshSavedCombo();
             cmbSavedSeq.SelectedItem = name;
@@ -555,7 +638,7 @@ namespace AutoClickerApp
         {
             string name = cmbSavedSeq.SelectedItem as string;
             if (name == null || !savedSequences.ContainsKey(name)) return;
-            sequence = new List<Point>(savedSequences[name]);
+            sequence = new List<SequenceStep>(savedSequences[name]);
             RefreshSequenceList();
         }
 
@@ -578,7 +661,7 @@ namespace AutoClickerApp
             try
             {
                 string currentName = null;
-                List<Point> currentList = null;
+                List<SequenceStep> currentList = null;
                 foreach (var rawLine in File.ReadAllLines(SaveFile))
                 {
                     string line = rawLine.Trim();
@@ -586,15 +669,20 @@ namespace AutoClickerApp
                     if (line.StartsWith("#"))
                     {
                         currentName = line.Substring(1);
-                        currentList = new List<Point>();
+                        currentList = new List<SequenceStep>();
                         savedSequences[currentName] = currentList;
                     }
                     else if (currentList != null)
                     {
                         string[] parts = line.Split(',');
-                        int px, py;
-                        if (parts.Length == 2 && int.TryParse(parts[0], out px) && int.TryParse(parts[1], out py))
-                            currentList.Add(new Point(px, py));
+                        int px, py, vk;
+                        if (parts.Length == 3 && parts[0] == "C" && int.TryParse(parts[1], out px) && int.TryParse(parts[2], out py))
+                            currentList.Add(SequenceStep.ForClick(new Point(px, py)));
+                        else if (parts.Length == 2 && parts[0] == "K" && int.TryParse(parts[1], out vk))
+                            currentList.Add(SequenceStep.ForKey((Keys)vk));
+                        else if (parts.Length == 2 && int.TryParse(parts[0], out px) && int.TryParse(parts[1], out py))
+                            // legacy format (pre-1.0.2 save files): plain "x,y" with no prefix
+                            currentList.Add(SequenceStep.ForClick(new Point(px, py)));
                     }
                 }
             }
@@ -614,8 +702,11 @@ namespace AutoClickerApp
                     foreach (var kv in savedSequences)
                     {
                         w.WriteLine("#" + kv.Key);
-                        foreach (var p in kv.Value)
-                            w.WriteLine(p.X + "," + p.Y);
+                        foreach (var step in kv.Value)
+                        {
+                            if (step.IsKey) w.WriteLine("K," + (int)step.Key);
+                            else w.WriteLine("C," + step.Position.X + "," + step.Position.Y);
+                        }
                     }
                 }
             }
@@ -1003,10 +1094,11 @@ namespace AutoClickerApp
             long totalMs = (long)numHours.Value * 3600000L + (long)numMinutes.Value * 60000L + (long)numSeconds.Value * 1000L + (long)numMillis.Value;
             if (totalMs < 10) totalMs = 10;
             if (totalMs > int.MaxValue) totalMs = int.MaxValue;
+            baseIntervalMs = totalMs;
 
             clicksDone = 0;
             seqPlayIndex = 0;
-            clickTimer.Interval = (int)totalMs;
+            clickTimer.Interval = ComputeIntervalMs();
             isRunning = true;
             btnStartStop.Text = "Stop (F6)";
             menuToggle.Text = "Stop (F6)";
@@ -1045,30 +1137,38 @@ namespace AutoClickerApp
                 return;
             }
 
-            Point target;
             string stepInfo = "";
 
             if (radFixedPos.Checked)
             {
-                target = new Point((int)numX.Value, (int)numY.Value);
+                Cursor.Position = new Point((int)numX.Value, (int)numY.Value);
+                DoClick();
+                if (chkDouble.Checked) DoClick();
             }
             else if (radSequence.Checked)
             {
                 if (sequence.Count == 0) { StopClicking(); return; }
                 if (seqPlayIndex >= sequence.Count) seqPlayIndex = 0;
-                target = sequence[seqPlayIndex];
+                SequenceStep step = sequence[seqPlayIndex];
                 stepInfo = string.Format(" (step {0}/{1})", seqPlayIndex + 1, sequence.Count);
                 seqPlayIndex = (seqPlayIndex + 1) % sequence.Count;
+
+                if (step.IsKey)
+                {
+                    DoKeyPress(step.Key);
+                }
+                else
+                {
+                    Cursor.Position = step.Position;
+                    DoClick();
+                    if (chkDouble.Checked) DoClick();
+                }
             }
             else
             {
-                target = Cursor.Position;
+                DoClick();
+                if (chkDouble.Checked) DoClick();
             }
-
-            Cursor.Position = target;
-
-            DoClick();
-            if (chkDouble.Checked) DoClick();
 
             clicksDone++;
             if (!isLicensed)
@@ -1076,13 +1176,29 @@ namespace AutoClickerApp
                 trialClicksUsed++;
                 lblLicenseStatus.Text = string.Format("Trial mode — {0}/{1} clicks used", trialClicksUsed, TRIAL_CLICK_LIMIT);
             }
-            lblCount.Text = "Clicks performed: " + clicksDone;
+            lblCount.Text = "Actions performed: " + clicksDone;
             lblStatus.Text = "Status: RUNNING" + stepInfo;
+
+            clickTimer.Interval = ComputeIntervalMs();
 
             if (radCount.Checked && clicksDone >= numCount.Value)
             {
                 StopClicking();
             }
+        }
+
+        // Picks the next interval: the fixed base interval, or - when randomization is on - a
+        // uniformly random value within ±numRandomMs of it (clamped so it never drops below 10ms).
+        int ComputeIntervalMs()
+        {
+            if (!chkRandomize.Checked || numRandomMs.Value <= 0)
+                return (int)Math.Min(baseIntervalMs, int.MaxValue);
+
+            int range = (int)numRandomMs.Value;
+            long lo = Math.Max(10, baseIntervalMs - range);
+            long hi = Math.Min(int.MaxValue, baseIntervalMs + range);
+            if (hi < lo) hi = lo;
+            return rng.Next((int)lo, (int)hi + 1);
         }
 
         void DoClick()
@@ -1096,6 +1212,13 @@ namespace AutoClickerApp
             }
             mouse_event(down, 0, 0, 0, UIntPtr.Zero);
             mouse_event(up, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        void DoKeyPress(Keys key)
+        {
+            byte vk = (byte)key;
+            keybd_event(vk, 0, 0, UIntPtr.Zero);
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
         }
     }
 }
