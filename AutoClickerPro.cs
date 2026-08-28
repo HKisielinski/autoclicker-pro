@@ -8,6 +8,7 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.VisualBasic;
+using Microsoft.Win32;
 
 namespace AutoClickerApp
 {
@@ -127,9 +128,14 @@ namespace AutoClickerApp
         const int TRIAL_CLICK_LIMIT = 100;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.0.2";
+        const string APP_VERSION = "1.0.3";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
+
+        // --- Start with Windows ---
+        const string STARTUP_REGISTRY_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string STARTUP_VALUE_NAME = "AutoClickerPro";
+        CheckBox chkStartWithWindows;
 
         bool isLicensed = false;
         string licenseKey = "";
@@ -194,7 +200,7 @@ namespace AutoClickerApp
             MaximizeBox = false;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(340, 1030);
+            ClientSize = new Size(340, 1065);
             Font = new Font("Segoe UI", 9F);
 
             try
@@ -436,9 +442,51 @@ namespace AutoClickerApp
             lblHotkeyInfo = new Label { Text = "F6 = start/stop clicking, F7 = start/stop recording clicks + key presses (global). Closing the window (X) minimizes it to the system tray — right-click the tray icon to exit for good.", Left = 10, Top = y, Width = 310, Height = 55, ForeColor = Color.Gray, TextAlign = ContentAlignment.MiddleCenter };
             Controls.Add(lblHotkeyInfo);
 
-            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 990, Width = 310, Height = 28 };
+            chkStartWithWindows = new CheckBox { Text = "Start with Windows", Left = 10, Top = 990, Width = 310, Checked = IsStartupEnabled() };
+            chkStartWithWindows.CheckedChanged += (s, e) => SetStartupEnabled(chkStartWithWindows.Checked);
+            Controls.Add(chkStartWithWindows);
+
+            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 1022, Width = 310, Height = 28 };
             btnCheckUpdate.Click += BtnCheckUpdate_Click;
             Controls.Add(btnCheckUpdate);
+        }
+
+        // --- Start with Windows ---
+
+        bool IsStartupEnabled()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(STARTUP_REGISTRY_KEY, false))
+                {
+                    if (key == null) return false;
+                    return !string.IsNullOrEmpty(key.GetValue(STARTUP_VALUE_NAME) as string);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        void SetStartupEnabled(bool enabled)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(STARTUP_REGISTRY_KEY, true))
+                {
+                    if (key == null) return;
+                    if (enabled)
+                        key.SetValue(STARTUP_VALUE_NAME, "\"" + Application.ExecutablePath + "\"");
+                    else
+                        key.DeleteValue(STARTUP_VALUE_NAME, false);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Could not update the Windows startup setting: " + ex.Message, "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         // --- Sequence: list editing ---
