@@ -157,7 +157,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.0.6";
+        const string APP_VERSION = "1.0.7";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -247,6 +247,7 @@ namespace AutoClickerApp
             }
 
             BuildUi();
+            LogStartup("=== App startup, PID=" + Process.GetCurrentProcess().Id + ", version=" + APP_VERSION + " ===");
             LoadAllFromFile();
             RefreshSavedCombo();
             LoadLicenseState();
@@ -816,19 +817,54 @@ namespace AutoClickerApp
         // falling back to an empty/trial state.
         static string[] ReadAllLinesWithRetry(string path)
         {
-            const int attempts = 5;
+            const int attempts = 10;
             for (int i = 0; i < attempts - 1; i++)
             {
-                try { return File.ReadAllLines(path); }
-                catch (IOException) { System.Threading.Thread.Sleep(150); }
+                try
+                {
+                    var lines = File.ReadAllLines(path);
+                    if (i > 0) LogStartup("ReadAllLinesWithRetry(" + path + ") succeeded on attempt " + (i + 1));
+                    return lines;
+                }
+                catch (IOException ex)
+                {
+                    LogStartup("ReadAllLinesWithRetry(" + path + ") attempt " + (i + 1) + " failed: " + ex.Message);
+                    System.Threading.Thread.Sleep(250);
+                }
             }
             return File.ReadAllLines(path);
+        }
+
+        // Quiet, append-only forensic log for the startup load path — never shown to the user,
+        // just so a future "why did my license/sequences look empty" report has hard evidence
+        // instead of guesswork. Capped in size so it can't grow unbounded over months of use.
+        static readonly string LogFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClickerPro", "startup_log.txt");
+        static void LogStartup(string message)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(LogFile);
+                Directory.CreateDirectory(dir);
+                if (File.Exists(LogFile) && new FileInfo(LogFile).Length > 200 * 1024)
+                    File.Delete(LogFile);
+                File.AppendAllText(LogFile, DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff") + "Z  " + message + Environment.NewLine);
+            }
+            catch
+            {
+                // logging is best-effort only
+            }
         }
 
         void LoadAllFromFile()
         {
             savedSequences.Clear();
-            if (!File.Exists(SaveFile)) return;
+            if (!File.Exists(SaveFile))
+            {
+                LogStartup("LoadAllFromFile: SaveFile does not exist at " + SaveFile);
+                return;
+            }
+            LogStartup("LoadAllFromFile: SaveFile exists, size=" + new FileInfo(SaveFile).Length + " bytes");
             try
             {
                 string currentName = null;
@@ -890,11 +926,13 @@ namespace AutoClickerApp
                             currentData.Steps.Add(SequenceStep.ForClick(new Point(px, py)));
                     }
                 }
+                LogStartup("LoadAllFromFile: parsed " + savedSequences.Count + " saved sequence(s)");
             }
             catch (Exception ex)
             {
                 savedSequences.Clear();
                 sequencesLoadFailed = true;
+                LogStartup("LoadAllFromFile: EXCEPTION " + ex);
                 MessageBox.Show("Could not read your saved sequences (the file may be locked or corrupted):\n\n" + ex.Message +
                     "\n\nYour saved sequences were NOT deleted — close this app without saving anything, then try reopening it.",
                     "Failed to Load Saved Sequences", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -948,6 +986,7 @@ namespace AutoClickerApp
             isLifetimeLicense = false;
             if (!File.Exists(LicenseFile))
             {
+                LogStartup("LoadLicenseState: LicenseFile does not exist at " + LicenseFile);
                 if (DEMO_BUILD)
                 {
                     isLicensed = true;
@@ -957,6 +996,7 @@ namespace AutoClickerApp
                 }
                 return;
             }
+            LogStartup("LoadLicenseState: LicenseFile exists, size=" + new FileInfo(LicenseFile).Length + " bytes");
             try
             {
                 foreach (var rawLine in ReadAllLinesWithRetry(LicenseFile))
@@ -981,19 +1021,24 @@ namespace AutoClickerApp
                     }
                     else if (k == "lifetime") isLifetimeLicense = (v == "1");
                 }
+                LogStartup("LoadLicenseState: parsed licensed=" + isLicensed + " key=" + (licenseKey.Length > 0 ? "(set, len=" + licenseKey.Length + ")" : "(empty)") + " trialClicks=" + trialClicksUsed);
             }
             catch (Exception ex)
             {
                 isLicensed = false;
                 licenseKey = "";
                 licenseLoadFailed = true;
+                LogStartup("LoadLicenseState: EXCEPTION " + ex);
                 MessageBox.Show("Could not read your license file (it may be locked or corrupted):\n\n" + ex.Message +
                     "\n\nYour license was NOT deleted — close this app without entering a new key, then try reopening it.",
                     "Failed to Load License", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
             if (isLicensed && licenseExpiresUtc != DateTime.MinValue && DateTime.UtcNow >= licenseExpiresUtc)
+            {
+                LogStartup("LoadLicenseState: license expired (expiresUtc=" + licenseExpiresUtc + "), downgrading to trial");
                 isLicensed = false;
+            }
         }
 
         void SaveLicenseState()
