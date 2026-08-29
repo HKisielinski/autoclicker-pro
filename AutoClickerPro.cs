@@ -160,7 +160,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.1.0";
+        const string APP_VERSION = "1.1.1";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -264,11 +264,14 @@ namespace AutoClickerApp
         public MainForm()
         {
             Text = "AutoClicker Pro";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(340, 1162);
+            int maxUsableHeight = Screen.PrimaryScreen.WorkingArea.Height - 60;
+            ClientSize = new Size(340, Math.Min(1162, maxUsableHeight));
+            MinimumSize = new Size(356, 300);
+            AutoScroll = true;
             Font = new Font("Segoe UI", 9F);
 
             try
