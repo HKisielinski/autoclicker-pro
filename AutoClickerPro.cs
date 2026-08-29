@@ -141,6 +141,13 @@ namespace AutoClickerApp
         const string GUMROAD_PRODUCT_PERMALINK = "elmyts";
         const string GUMROAD_PRODUCT_ID = "IUP5J8WWTTU9l08vcLRz7w==";
         static string GumroadBuyUrl { get { return "https://gumroad.com/l/" + GUMROAD_PRODUCT_PERMALINK; } }
+
+        // A separate, one-time-purchase "pay once" product, since Gumroad memberships don't
+        // support a non-recurring tier within the same product.
+        const string GUMROAD_LIFETIME_PRODUCT_PERMALINK = "rtsiyn";
+        const string GUMROAD_LIFETIME_PRODUCT_ID = "IO5FbgFBH_cIqyz2JGjG6g==";
+        static string GumroadLifetimeBuyUrl { get { return "https://gumroad.com/l/" + GUMROAD_LIFETIME_PRODUCT_PERMALINK; } }
+
         const int TRIAL_CLICK_LIMIT = 100;
 
         // When true, a build with no existing license.txt auto-grants full access for
@@ -150,7 +157,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.0.5";
+        const string APP_VERSION = "1.0.6";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -166,6 +173,7 @@ namespace AutoClickerApp
         DateTime licenseExpiresUtc = DateTime.MinValue;
         bool sequencesLoadFailed = false;
         bool licenseLoadFailed = false;
+        bool isLifetimeLicense = false;
 
         GroupBox grpLicense;
         Label lblLicenseStatus, lblPricing;
@@ -326,7 +334,7 @@ namespace AutoClickerApp
 
             grpLicense = new GroupBox { Text = "License", Left = 10, Top = y, Width = 310, Height = 105 };
             lblLicenseStatus = new Label { Left = 10, Top = 20, Width = 290, Height = 18, Text = "Trial mode", ForeColor = Color.DimGray };
-            lblPricing = new Label { Left = 10, Top = 38, Width = 290, Height = 16, Text = "Plans: $5 / month or $10 / year", ForeColor = Color.Gray, Font = new Font("Segoe UI", 8F) };
+            lblPricing = new Label { Left = 10, Top = 38, Width = 290, Height = 16, Text = "Plans: $5/mo, $10/yr, or $20 one-time (lifetime)", ForeColor = Color.Gray, Font = new Font("Segoe UI", 8F) };
             btnBuyLicense = new Button { Text = "Buy License", Left = 10, Top = 68, Width = 140 };
             btnEnterKey = new Button { Text = "Enter License Key", Left = 160, Top = 68, Width = 140 };
             btnBuyLicense.Click += BtnBuyLicense_Click;
@@ -937,6 +945,7 @@ namespace AutoClickerApp
             licenseKey = "";
             trialClicksUsed = 0;
             licenseExpiresUtc = DateTime.MinValue;
+            isLifetimeLicense = false;
             if (!File.Exists(LicenseFile))
             {
                 if (DEMO_BUILD)
@@ -970,6 +979,7 @@ namespace AutoClickerApp
                         long ticks;
                         if (long.TryParse(v, out ticks) && ticks > 0) licenseExpiresUtc = new DateTime(ticks, DateTimeKind.Utc);
                     }
+                    else if (k == "lifetime") isLifetimeLicense = (v == "1");
                 }
             }
             catch (Exception ex)
@@ -1001,6 +1011,7 @@ namespace AutoClickerApp
                     w.WriteLine("trialClicks=" + trialClicksUsed);
                     w.WriteLine("lastVerified=" + lastVerifiedUtc.Ticks);
                     w.WriteLine("expiresUtc=" + licenseExpiresUtc.Ticks);
+                    w.WriteLine("lifetime=" + (isLifetimeLicense ? "1" : "0"));
                 }
             }
             catch
@@ -1022,7 +1033,9 @@ namespace AutoClickerApp
                 else
                 {
                     string masked = licenseKey.Length > 4 ? "•••• " + licenseKey.Substring(licenseKey.Length - 4) : licenseKey;
-                    lblLicenseStatus.Text = "Subscription active — thank you! (key ending " + masked + ")";
+                    lblLicenseStatus.Text = isLifetimeLicense
+                        ? "Lifetime license active — thank you! (key ending " + masked + ")"
+                        : "Subscription active — thank you! (key ending " + masked + ")";
                     lblLicenseStatus.ForeColor = Color.Green;
                 }
                 btnEnterKey.Text = "Change License Key";
@@ -1039,9 +1052,14 @@ namespace AutoClickerApp
 
         void BtnBuyLicense_Click(object sender, EventArgs e)
         {
+            var result = MessageBox.Show(this,
+                "Choose a plan:\n\nYes = Lifetime license, $20 one-time (pay once, use forever)\nNo = Subscription, $5/month or $10/year",
+                "Choose a Plan", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (result == DialogResult.Cancel) return;
+
             try
             {
-                Process.Start(GumroadBuyUrl);
+                Process.Start(result == DialogResult.Yes ? GumroadLifetimeBuyUrl : GumroadBuyUrl);
             }
             catch (Exception ex)
             {
@@ -1061,7 +1079,8 @@ namespace AutoClickerApp
             btnBuyLicense.Enabled = false;
             string error;
             bool subscriptionEnded;
-            bool ok = VerifyGumroadLicense(key, out error, out subscriptionEnded);
+            bool matchedLifetime;
+            bool ok = VerifyGumroadLicense(key, out error, out subscriptionEnded, out matchedLifetime);
             Cursor = Cursors.Default;
             btnEnterKey.Enabled = true;
             btnBuyLicense.Enabled = true;
@@ -1080,9 +1099,12 @@ namespace AutoClickerApp
                 lastVerifiedUtc = DateTime.UtcNow;
                 licenseExpiresUtc = DateTime.MinValue;
                 licenseLoadFailed = false;
+                isLifetimeLicense = matchedLifetime;
                 SaveLicenseState();
                 UpdateLicenseUi();
-                MessageBox.Show(this, "License activated successfully. Thank you for your subscription!",
+                MessageBox.Show(this, matchedLifetime
+                    ? "License activated successfully. Thank you for your lifetime purchase!"
+                    : "License activated successfully. Thank you for your subscription!",
                     "License Activated", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
@@ -1093,11 +1115,38 @@ namespace AutoClickerApp
 
         // Checks a license key against Gumroad and reports whether its subscription (if any) has
         // ended — Gumroad keeps the key valid forever but sets these timestamps once a recurring
-        // subscription is cancelled, fails to renew, or otherwise ends.
-        bool VerifyGumroadLicense(string key, out string errorMessage, out bool subscriptionEnded)
+        // subscription is cancelled, fails to renew, or otherwise ends. A key could belong to
+        // either the subscription product or the separate one-time lifetime product, so try the
+        // subscription product first and fall back to the lifetime product if that's not a match.
+        bool VerifyGumroadLicense(string key, out string errorMessage, out bool subscriptionEnded, out bool isLifetime)
+        {
+            bool connectivityError;
+            if (VerifyGumroadLicenseForProduct(key, GUMROAD_PRODUCT_ID, out errorMessage, out subscriptionEnded, out connectivityError))
+            {
+                isLifetime = false;
+                return true;
+            }
+            isLifetime = false;
+            if (connectivityError) return false;
+
+            string lifetimeError;
+            bool lifetimeConnectivityError;
+            if (VerifyGumroadLicenseForProduct(key, GUMROAD_LIFETIME_PRODUCT_ID, out lifetimeError, out subscriptionEnded, out lifetimeConnectivityError))
+            {
+                isLifetime = true;
+                errorMessage = null;
+                return true;
+            }
+
+            errorMessage = lifetimeConnectivityError ? lifetimeError : "This license key is not valid.";
+            return false;
+        }
+
+        bool VerifyGumroadLicenseForProduct(string key, string productId, out string errorMessage, out bool subscriptionEnded, out bool isConnectivityError)
         {
             errorMessage = null;
             subscriptionEnded = false;
+            isConnectivityError = false;
             string json;
 
             try
@@ -1109,7 +1158,7 @@ namespace AutoClickerApp
                 using (var client = new WebClient())
                 {
                     var data = new NameValueCollection();
-                    data["product_id"] = GUMROAD_PRODUCT_ID;
+                    data["product_id"] = productId;
                     data["license_key"] = key;
                     data["increment_uses_count"] = "false";
                     byte[] responseBytes = client.UploadValues("https://api.gumroad.com/v2/licenses/verify", data);
@@ -1126,6 +1175,7 @@ namespace AutoClickerApp
                 if (wex.Response == null)
                 {
                     errorMessage = "Could not reach the license server. Check your internet connection and try again.";
+                    isConnectivityError = true;
                     return false;
                 }
                 using (var stream = wex.Response.GetResponseStream())
@@ -1137,6 +1187,7 @@ namespace AutoClickerApp
             catch (Exception ex)
             {
                 errorMessage = "Unexpected error while verifying the license: " + ex.Message;
+                isConnectivityError = true;
                 return false;
             }
 
@@ -1186,7 +1237,8 @@ namespace AutoClickerApp
             {
                 string error;
                 bool subEnded;
-                bool ok = VerifyGumroadLicense(keyCopy, out error, out subEnded);
+                bool matchedLifetime;
+                bool ok = VerifyGumroadLicense(keyCopy, out error, out subEnded, out matchedLifetime);
                 if (!ok) return; // offline or transient error — keep the cached license, retry later
 
                 try
