@@ -57,6 +57,9 @@ namespace AutoClickerApp
         [DllImport("user32.dll")]
         static extern IntPtr GetForegroundWindow();
 
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+
         delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
         delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -157,7 +160,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.0.7";
+        const string APP_VERSION = "1.1.0";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -204,6 +207,38 @@ namespace AutoClickerApp
         long baseIntervalMs;
         readonly Random rng = new Random();
 
+        // --- Advanced features (own popup window; see BuildAdvancedUi) ---
+        Form advancedForm;
+        Button btnAdvanced;
+
+        CheckBox chkDryRun;
+
+        CheckBox chkFocusGate;
+        TextBox txtFocusTitle;
+        Button btnPickFocusWindow;
+
+        CheckBox chkScheduleStart, chkScheduleStop;
+        TextBox txtScheduleStart, txtScheduleStop;
+        Timer scheduleTimer;
+        string lastScheduleStartFired = "", lastScheduleStopFired = "";
+
+        CheckBox chkPixelWait;
+        Button btnPickPixel;
+        Label lblPixelInfo;
+        NumericUpDown numPixelTolerance;
+        Point pixelTarget = Point.Empty;
+        Color pixelTargetColor = Color.Black;
+        bool pixelPicked = false;
+        const int PIXEL_POLL_MS = 200;
+
+        ListBox lstPlaylist;
+        Button btnPlaylistAdd, btnPlaylistRemove, btnPlaylistUp, btnPlaylistDown;
+        CheckBox chkUsePlaylist;
+        List<string> playlist = new List<string>();
+        int playlistIndex = 0;
+        string PlaylistFile { get { return Path.Combine(saveDir, "playlist.txt"); } }
+        string AdvancedSettingsFile { get { return Path.Combine(saveDir, "advanced_settings.txt"); } }
+
         Dictionary<string, SavedSequenceData> savedSequences = new Dictionary<string, SavedSequenceData>();
         readonly string saveDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClickerPro");
         string SaveFile { get { return Path.Combine(saveDir, "sequences.txt"); } }
@@ -233,7 +268,7 @@ namespace AutoClickerApp
             MaximizeBox = false;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(340, 1127);
+            ClientSize = new Size(340, 1162);
             Font = new Font("Segoe UI", 9F);
 
             try
@@ -247,9 +282,13 @@ namespace AutoClickerApp
             }
 
             BuildUi();
+            BuildAdvancedUi();
             LogStartup("=== App startup, PID=" + Process.GetCurrentProcess().Id + ", version=" + APP_VERSION + " ===");
             LoadAllFromFile();
             RefreshSavedCombo();
+            LoadPlaylist();
+            RefreshPlaylistList();
+            LoadAdvancedSettings();
             LoadLicenseState();
             UpdateLicenseUi();
             SetupTray();
@@ -260,6 +299,11 @@ namespace AutoClickerApp
             pickCountdownTimer = new Timer();
             pickCountdownTimer.Interval = 1000;
             pickCountdownTimer.Tick += PickCountdownTimer_Tick;
+
+            scheduleTimer = new Timer();
+            scheduleTimer.Interval = 20000;
+            scheduleTimer.Tick += ScheduleTimer_Tick;
+            scheduleTimer.Start();
 
             Load += (s, e) =>
             {
@@ -486,9 +530,109 @@ namespace AutoClickerApp
             chkStartWithWindows.CheckedChanged += (s, e) => SetStartupEnabled(chkStartWithWindows.Checked);
             Controls.Add(chkStartWithWindows);
 
-            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 1084, Width = 310, Height = 28 };
+            btnAdvanced = new Button { Text = "Advanced Features...", Left = 10, Top = 1084, Width = 310, Height = 28 };
+            btnAdvanced.Click += (s, e) => { advancedForm.Show(); advancedForm.WindowState = FormWindowState.Normal; advancedForm.Activate(); advancedForm.BringToFront(); };
+            Controls.Add(btnAdvanced);
+
+            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 1119, Width = 310, Height = 28 };
             btnCheckUpdate.Click += BtnCheckUpdate_Click;
             Controls.Add(btnCheckUpdate);
+        }
+
+        // Advanced features live in their own popup window instead of stretching the main
+        // window past what fits on a laptop screen. It's non-modal: Show()/Hide(), never
+        // ShowDialog(), so the main window keeps working while it's open.
+        void BuildAdvancedUi()
+        {
+            advancedForm = new Form
+            {
+                Text = "Advanced Features",
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ShowInTaskbar = false,
+                StartPosition = FormStartPosition.CenterParent,
+                ClientSize = new Size(340, 700),
+                Font = Font,
+                Owner = this
+            };
+            advancedForm.FormClosing += (s, e) =>
+            {
+                // This popup should only ever be hidden, never destroyed — the whole process
+                // exiting is the only real "close" it needs, and that never fires FormClosing here.
+                e.Cancel = true;
+                advancedForm.Hide();
+                SaveAdvancedSettings();
+            };
+
+            int ay = 10;
+
+            var grpDry = new GroupBox { Text = "Dry Run", Left = 10, Top = ay, Width = 310, Height = 55 };
+            chkDryRun = new CheckBox { Text = "Move the cursor but don't actually click", Left = 10, Top = 22, Width = 290 };
+            grpDry.Controls.Add(chkDryRun);
+            advancedForm.Controls.Add(grpDry);
+            ay += 65;
+
+            var grpPixel = new GroupBox { Text = "Wait For Pixel Color", Left = 10, Top = ay, Width = 310, Height = 140 };
+            chkPixelWait = new CheckBox { Text = "Wait until a screen pixel matches before clicking", Left = 10, Top = 20, Width = 290 };
+            btnPickPixel = new Button { Text = "Pick pixel (3s)", Left = 10, Top = 45, Width = 150, Tag = "Pick pixel (3s)" };
+            lblPixelInfo = new Label { Text = "Target: not picked yet", Left = 10, Top = 78, Width = 290, ForeColor = Color.DimGray };
+            var lblTolerance = new Label { Text = "Tolerance:", Left = 10, Top = 105, Width = 90, TextAlign = ContentAlignment.MiddleLeft };
+            numPixelTolerance = new NumericUpDown { Left = 100, Top = 103, Width = 60, Maximum = 255, Value = 20 };
+            btnPickPixel.Click += (s, e) => StartPick(2, btnPickPixel);
+            grpPixel.Controls.Add(chkPixelWait);
+            grpPixel.Controls.Add(btnPickPixel);
+            grpPixel.Controls.Add(lblPixelInfo);
+            grpPixel.Controls.Add(lblTolerance);
+            grpPixel.Controls.Add(numPixelTolerance);
+            advancedForm.Controls.Add(grpPixel);
+            ay += 150;
+
+            var grpFocus = new GroupBox { Text = "Only Click When Window Is Focused", Left = 10, Top = ay, Width = 310, Height = 90 };
+            chkFocusGate = new CheckBox { Text = "Only click while this window is active:", Left = 10, Top = 20, Width = 290 };
+            txtFocusTitle = new TextBox { Left = 10, Top = 46, Width = 195 };
+            btnPickFocusWindow = new Button { Text = "Pick (3s)", Left = 215, Top = 44, Width = 85, Tag = "Pick (3s)" };
+            btnPickFocusWindow.Click += (s, e) => StartPick(3, btnPickFocusWindow);
+            grpFocus.Controls.Add(chkFocusGate);
+            grpFocus.Controls.Add(txtFocusTitle);
+            grpFocus.Controls.Add(btnPickFocusWindow);
+            advancedForm.Controls.Add(grpFocus);
+            ay += 100;
+
+            var grpSchedule = new GroupBox { Text = "Schedule", Left = 10, Top = ay, Width = 310, Height = 100 };
+            chkScheduleStart = new CheckBox { Text = "Auto-start at", Left = 10, Top = 22, Width = 110 };
+            txtScheduleStart = new TextBox { Left = 125, Top = 20, Width = 60, Text = "22:00" };
+            chkScheduleStop = new CheckBox { Text = "Auto-stop at", Left = 10, Top = 50, Width = 110 };
+            txtScheduleStop = new TextBox { Left = 125, Top = 48, Width = 60, Text = "06:00" };
+            var lblScheduleNote = new Label { Text = "24h time, e.g. 22:00", Left = 10, Top = 76, Width = 290, ForeColor = Color.Gray, Font = new Font("Segoe UI", 8F) };
+            grpSchedule.Controls.Add(chkScheduleStart);
+            grpSchedule.Controls.Add(txtScheduleStart);
+            grpSchedule.Controls.Add(chkScheduleStop);
+            grpSchedule.Controls.Add(txtScheduleStop);
+            grpSchedule.Controls.Add(lblScheduleNote);
+            advancedForm.Controls.Add(grpSchedule);
+            ay += 110;
+
+            var grpPlaylist = new GroupBox { Text = "Playlist (chain saved sequences)", Left = 10, Top = ay, Width = 310, Height = 220 };
+            lstPlaylist = new ListBox { Left = 10, Top = 20, Width = 290, Height = 90 };
+            btnPlaylistAdd = new Button { Text = "Add selected saved sequence", Left = 10, Top = 115, Width = 290, Height = 26 };
+            btnPlaylistRemove = new Button { Text = "Remove", Left = 10, Top = 144, Width = 145 };
+            btnPlaylistUp = new Button { Text = "▲ Up", Left = 10, Top = 173, Width = 90 };
+            btnPlaylistDown = new Button { Text = "▼ Down", Left = 110, Top = 173, Width = 90 };
+            chkUsePlaylist = new CheckBox { Text = "Play as playlist (needs \"Position sequence\" mode)", Left = 10, Top = 200, Width = 290 };
+            btnPlaylistAdd.Click += BtnPlaylistAdd_Click;
+            btnPlaylistRemove.Click += BtnPlaylistRemove_Click;
+            btnPlaylistUp.Click += (s, e) => MovePlaylistSelected(-1);
+            btnPlaylistDown.Click += (s, e) => MovePlaylistSelected(1);
+            chkUsePlaylist.CheckedChanged += (s, e) => SavePlaylist();
+            grpPlaylist.Controls.Add(lstPlaylist);
+            grpPlaylist.Controls.Add(btnPlaylistAdd);
+            grpPlaylist.Controls.Add(btnPlaylistRemove);
+            grpPlaylist.Controls.Add(btnPlaylistUp);
+            grpPlaylist.Controls.Add(btnPlaylistDown);
+            grpPlaylist.Controls.Add(chkUsePlaylist);
+            advancedForm.Controls.Add(grpPlaylist);
+            ay += 230;
         }
 
         // --- Start with Windows ---
@@ -633,10 +777,24 @@ namespace AutoClickerApp
                     numX.Value = Math.Max(numX.Minimum, Math.Min(numX.Maximum, p.X));
                     numY.Value = Math.Max(numY.Minimum, Math.Min(numY.Maximum, p.Y));
                 }
-                else
+                else if (pickMode == 1)
                 {
                     sequence.Add(SequenceStep.ForClick(p));
                     RefreshSequenceList();
+                }
+                else if (pickMode == 2)
+                {
+                    pixelTarget = p;
+                    pixelTargetColor = GetScreenPixel(p.X, p.Y);
+                    pixelPicked = true;
+                    UpdatePixelInfoLabel();
+                }
+                else if (pickMode == 3)
+                {
+                    IntPtr fg = GetForegroundWindow();
+                    var sb = new System.Text.StringBuilder(256);
+                    GetWindowText(fg, sb, sb.Capacity);
+                    txtFocusTitle.Text = sb.ToString();
                 }
                 activePickButton.Text = (string)activePickButton.Tag;
                 btnPickPos.Enabled = radFixedPos.Checked;
@@ -646,6 +804,29 @@ namespace AutoClickerApp
             {
                 activePickButton.Text = "Set cursor... " + pickCountdown;
             }
+        }
+
+        static Color GetScreenPixel(int x, int y)
+        {
+            using (var bmp = new Bitmap(1, 1))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.CopyFromScreen(x, y, 0, 0, new Size(1, 1));
+                return bmp.GetPixel(0, 0);
+            }
+        }
+
+        void UpdatePixelInfoLabel()
+        {
+            if (lblPixelInfo == null) return;
+            lblPixelInfo.Text = pixelPicked
+                ? string.Format("Target: ({0}, {1}) = RGB({2},{3},{4})", pixelTarget.X, pixelTarget.Y, pixelTargetColor.R, pixelTargetColor.G, pixelTargetColor.B)
+                : "Target: not picked yet";
+        }
+
+        static bool ColorCloseEnough(Color a, Color b, int tolerance)
+        {
+            return Math.Abs(a.R - b.R) <= tolerance && Math.Abs(a.G - b.G) <= tolerance && Math.Abs(a.B - b.B) <= tolerance;
         }
 
         // --- Sequence: recording clicks live ---
@@ -811,6 +992,178 @@ namespace AutoClickerApp
             RefreshSavedCombo();
         }
 
+        // --- Playlist: chain several saved sequences together in one run ---
+
+        void RefreshPlaylistList()
+        {
+            lstPlaylist.Items.Clear();
+            foreach (var name in playlist) lstPlaylist.Items.Add(name);
+        }
+
+        void BtnPlaylistAdd_Click(object sender, EventArgs e)
+        {
+            string name = cmbSavedSeq.SelectedItem as string;
+            if (name == null)
+            {
+                MessageBox.Show(advancedForm, "Pick a sequence in the \"Saved Sequences\" list on the main window first.",
+                    "No Sequence Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            playlist.Add(name);
+            RefreshPlaylistList();
+            SavePlaylist();
+        }
+
+        void BtnPlaylistRemove_Click(object sender, EventArgs e)
+        {
+            int idx = lstPlaylist.SelectedIndex;
+            if (idx < 0) return;
+            playlist.RemoveAt(idx);
+            RefreshPlaylistList();
+            SavePlaylist();
+        }
+
+        void MovePlaylistSelected(int dir)
+        {
+            int idx = lstPlaylist.SelectedIndex;
+            int newIdx = idx + dir;
+            if (idx < 0 || newIdx < 0 || newIdx >= playlist.Count) return;
+            string tmp = playlist[idx];
+            playlist[idx] = playlist[newIdx];
+            playlist[newIdx] = tmp;
+            RefreshPlaylistList();
+            lstPlaylist.SelectedIndex = newIdx;
+            SavePlaylist();
+        }
+
+        void LoadPlaylist()
+        {
+            playlist.Clear();
+            if (!File.Exists(PlaylistFile)) return;
+            try
+            {
+                foreach (var line in ReadAllLinesWithRetry(PlaylistFile))
+                {
+                    if (line == "__USE_PLAYLIST__") { chkUsePlaylist.Checked = true; continue; }
+                    if (line.Trim().Length > 0) playlist.Add(line);
+                }
+            }
+            catch
+            {
+                // best-effort — an unreadable playlist file just starts empty
+            }
+        }
+
+        void SavePlaylist()
+        {
+            try
+            {
+                Directory.CreateDirectory(saveDir);
+                using (var w = new StreamWriter(PlaylistFile, false))
+                {
+                    if (chkUsePlaylist.Checked) w.WriteLine("__USE_PLAYLIST__");
+                    foreach (var name in playlist) w.WriteLine(name);
+                }
+            }
+            catch
+            {
+                // best-effort
+            }
+        }
+
+        // --- Advanced settings persistence (dry run, focus lock, schedule, pixel trigger) ---
+
+        void LoadAdvancedSettings()
+        {
+            if (!File.Exists(AdvancedSettingsFile)) return;
+            try
+            {
+                foreach (var rawLine in File.ReadAllLines(AdvancedSettingsFile))
+                {
+                    string line = rawLine.Trim();
+                    int eq = line.IndexOf('=');
+                    if (eq < 0) continue;
+                    string k = line.Substring(0, eq);
+                    string v = line.Substring(eq + 1);
+                    int n;
+                    switch (k)
+                    {
+                        case "dryRun": chkDryRun.Checked = v == "1"; break;
+                        case "focusGate": chkFocusGate.Checked = v == "1"; break;
+                        case "focusTitle": txtFocusTitle.Text = v; break;
+                        case "scheduleStart": chkScheduleStart.Checked = v == "1"; break;
+                        case "scheduleStartTime": txtScheduleStart.Text = v; break;
+                        case "scheduleStop": chkScheduleStop.Checked = v == "1"; break;
+                        case "scheduleStopTime": txtScheduleStop.Text = v; break;
+                        case "pixelWait": chkPixelWait.Checked = v == "1"; break;
+                        case "pixelX": if (int.TryParse(v, out n)) pixelTarget.X = n; break;
+                        case "pixelY": if (int.TryParse(v, out n)) pixelTarget.Y = n; break;
+                        case "pixelTolerance": if (int.TryParse(v, out n)) numPixelTolerance.Value = Clamp(numPixelTolerance, n); break;
+                        case "pixelColor":
+                            var parts = v.Split(',');
+                            int r, g, b;
+                            if (parts.Length == 3 && int.TryParse(parts[0], out r) && int.TryParse(parts[1], out g) && int.TryParse(parts[2], out b))
+                            {
+                                pixelTargetColor = Color.FromArgb(r, g, b);
+                                pixelPicked = true;
+                            }
+                            break;
+                    }
+                }
+                UpdatePixelInfoLabel();
+            }
+            catch
+            {
+                // best-effort — a corrupted settings file just falls back to defaults
+            }
+        }
+
+        void SaveAdvancedSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(saveDir);
+                using (var w = new StreamWriter(AdvancedSettingsFile, false))
+                {
+                    w.WriteLine("dryRun=" + (chkDryRun.Checked ? "1" : "0"));
+                    w.WriteLine("focusGate=" + (chkFocusGate.Checked ? "1" : "0"));
+                    w.WriteLine("focusTitle=" + txtFocusTitle.Text.Trim());
+                    w.WriteLine("scheduleStart=" + (chkScheduleStart.Checked ? "1" : "0"));
+                    w.WriteLine("scheduleStartTime=" + txtScheduleStart.Text.Trim());
+                    w.WriteLine("scheduleStop=" + (chkScheduleStop.Checked ? "1" : "0"));
+                    w.WriteLine("scheduleStopTime=" + txtScheduleStop.Text.Trim());
+                    w.WriteLine("pixelWait=" + (chkPixelWait.Checked ? "1" : "0"));
+                    w.WriteLine("pixelX=" + pixelTarget.X);
+                    w.WriteLine("pixelY=" + pixelTarget.Y);
+                    w.WriteLine("pixelColor=" + pixelTargetColor.R + "," + pixelTargetColor.G + "," + pixelTargetColor.B);
+                    w.WriteLine("pixelTolerance=" + numPixelTolerance.Value);
+                }
+            }
+            catch
+            {
+                // best-effort
+            }
+        }
+
+        // --- Schedule: auto start/stop at a given time of day ---
+
+        void ScheduleTimer_Tick(object sender, EventArgs e)
+        {
+            string nowKey = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+            string nowHm = DateTime.Now.ToString("HH:mm");
+
+            if (chkScheduleStart.Checked && !isRunning && nowHm == txtScheduleStart.Text.Trim() && lastScheduleStartFired != nowKey)
+            {
+                lastScheduleStartFired = nowKey;
+                StartClicking();
+            }
+            if (chkScheduleStop.Checked && isRunning && nowHm == txtScheduleStop.Text.Trim() && lastScheduleStopFired != nowKey)
+            {
+                lastScheduleStopFired = nowKey;
+                StopClicking();
+            }
+        }
+
         // A file that was just written by this same app (or is briefly locked by antivirus/
         // indexing right after being touched) can throw a sharing-violation IOException for a
         // few hundred ms. Retrying briefly avoids treating that as "no saved data" and silently
@@ -952,6 +1305,7 @@ namespace AutoClickerApp
             try
             {
                 Directory.CreateDirectory(saveDir);
+                BackupSaveFile();
                 using (var w = new StreamWriter(SaveFile, false))
                 {
                     foreach (var kv in savedSequences)
@@ -972,6 +1326,33 @@ namespace AutoClickerApp
             {
                 MessageBox.Show(this, "Failed to save sequences: " + ex.Message, "Save Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Keeps the last 5 versions of sequences.txt before each overwrite, so a bad edit or a
+        // save-time glitch never means losing everything — see backups\ next to sequences.txt.
+        const int MAX_BACKUPS = 5;
+        void BackupSaveFile()
+        {
+            try
+            {
+                if (!File.Exists(SaveFile)) return;
+                string backupDir = Path.Combine(saveDir, "backups");
+                Directory.CreateDirectory(backupDir);
+                string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
+                File.Copy(SaveFile, Path.Combine(backupDir, "sequences_" + stamp + ".txt"), true);
+
+                var files = new List<string>(Directory.GetFiles(backupDir, "sequences_*.txt"));
+                files.Sort();
+                while (files.Count > MAX_BACKUPS)
+                {
+                    File.Delete(files[0]);
+                    files.RemoveAt(0);
+                }
+            }
+            catch
+            {
+                // backups are best-effort — never block a real save over this
             }
         }
 
@@ -1432,6 +1813,18 @@ namespace AutoClickerApp
                 OfferPurchase();
                 return;
             }
+            bool usingPlaylist = chkUsePlaylist.Checked && radSequence.Checked;
+            if (usingPlaylist && playlist.Count == 0)
+            {
+                MessageBox.Show(this, "Add at least one saved sequence to the playlist first (Advanced Features window).", "Playlist Is Empty",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (usingPlaylist)
+            {
+                playlistIndex = 0;
+                LoadPlaylistItemIntoActive(0);
+            }
             if (radSequence.Checked && sequence.Count == 0)
             {
                 MessageBox.Show(this, "Add at least one position to the sequence.", "No Positions",
@@ -1439,13 +1832,16 @@ namespace AutoClickerApp
                 return;
             }
 
-            long totalMs = (long)numHours.Value * 3600000L + (long)numMinutes.Value * 60000L + (long)numSeconds.Value * 1000L + (long)numMillis.Value;
-            if (totalMs < 10) totalMs = 10;
-            if (totalMs > int.MaxValue) totalMs = int.MaxValue;
-            baseIntervalMs = totalMs;
+            if (!usingPlaylist)
+            {
+                long totalMs = (long)numHours.Value * 3600000L + (long)numMinutes.Value * 60000L + (long)numSeconds.Value * 1000L + (long)numMillis.Value;
+                if (totalMs < 10) totalMs = 10;
+                if (totalMs > int.MaxValue) totalMs = int.MaxValue;
+                baseIntervalMs = totalMs;
+                seqPlayIndex = 0;
+            }
 
             clicksDone = 0;
-            seqPlayIndex = 0;
             clickTimer.Interval = ComputeIntervalMs();
             isRunning = true;
             btnStartStop.Text = "Stop (F6)";
@@ -1485,11 +1881,22 @@ namespace AutoClickerApp
                 return;
             }
 
+            // Only click while a chosen window is the active/foreground one — skip this tick
+            // (keep waiting, poll again shortly) otherwise, so alt-tabbing away never bleeds
+            // clicks into whatever the user is doing instead.
+            if (chkFocusGate.Checked && txtFocusTitle.Text.Trim().Length > 0 && !IsFocusTargetActive())
+            {
+                clickTimer.Interval = PIXEL_POLL_MS;
+                return;
+            }
+
             string stepInfo = "";
             int stepCustomIntervalMs = -1;
+            bool usingPlaylist = chkUsePlaylist.Checked && radSequence.Checked && playlist.Count > 0;
 
             if (radFixedPos.Checked)
             {
+                if (chkPixelWait.Checked && pixelPicked && !PixelMatches()) { clickTimer.Interval = PIXEL_POLL_MS; return; }
                 Cursor.Position = new Point((int)numX.Value, (int)numY.Value);
                 DoClick();
                 if (chkDouble.Checked) DoClick();
@@ -1499,8 +1906,14 @@ namespace AutoClickerApp
                 if (sequence.Count == 0) { StopClicking(); return; }
                 if (seqPlayIndex >= sequence.Count) seqPlayIndex = 0;
                 SequenceStep step = sequence[seqPlayIndex];
-                stepInfo = string.Format(" (step {0}/{1})", seqPlayIndex + 1, sequence.Count);
+
+                if (chkPixelWait.Checked && pixelPicked && !PixelMatches()) { clickTimer.Interval = PIXEL_POLL_MS; return; }
+
+                stepInfo = usingPlaylist
+                    ? string.Format(" (playlist: {0}, step {1}/{2})", playlist[playlistIndex], seqPlayIndex + 1, sequence.Count)
+                    : string.Format(" (step {0}/{1})", seqPlayIndex + 1, sequence.Count);
                 stepCustomIntervalMs = step.CustomIntervalMs;
+                bool wrapped = (seqPlayIndex + 1) >= sequence.Count;
                 seqPlayIndex = (seqPlayIndex + 1) % sequence.Count;
 
                 if (step.IsKey)
@@ -1513,9 +1926,17 @@ namespace AutoClickerApp
                     DoClick();
                     if (chkDouble.Checked) DoClick();
                 }
+
+                if (usingPlaylist && wrapped)
+                {
+                    playlistIndex = (playlistIndex + 1) % playlist.Count;
+                    LoadPlaylistItemIntoActive(playlistIndex);
+                    stepCustomIntervalMs = -1; // the new item's own base interval applies from here
+                }
             }
             else
             {
+                if (chkPixelWait.Checked && pixelPicked && !PixelMatches()) { clickTimer.Interval = PIXEL_POLL_MS; return; }
                 DoClick();
                 if (chkDouble.Checked) DoClick();
             }
@@ -1535,6 +1956,43 @@ namespace AutoClickerApp
             {
                 StopClicking();
             }
+        }
+
+        bool IsFocusTargetActive()
+        {
+            IntPtr fg = GetForegroundWindow();
+            var sb = new System.Text.StringBuilder(256);
+            GetWindowText(fg, sb, sb.Capacity);
+            return sb.ToString().IndexOf(txtFocusTitle.Text.Trim(), StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        bool PixelMatches()
+        {
+            Color c = GetScreenPixel(pixelTarget.X, pixelTarget.Y);
+            return ColorCloseEnough(c, pixelTargetColor, (int)numPixelTolerance.Value);
+        }
+
+        // Swaps the active step list + timing to the given playlist entry's own saved sequence,
+        // exactly like loading it manually from "Saved Sequences" would.
+        void LoadPlaylistItemIntoActive(int idx)
+        {
+            if (idx < 0 || idx >= playlist.Count) return;
+            string name = playlist[idx];
+            if (!savedSequences.ContainsKey(name)) return;
+            var data = savedSequences[name];
+            sequence = new List<SequenceStep>(data.Steps);
+            RefreshSequenceList();
+            numHours.Value = Clamp(numHours, data.Hours);
+            numMinutes.Value = Clamp(numMinutes, data.Minutes);
+            numSeconds.Value = Clamp(numSeconds, data.Seconds);
+            numMillis.Value = Clamp(numMillis, data.Millis);
+            chkRandomize.Checked = data.Randomize;
+            numRandomMs.Value = Clamp(numRandomMs, data.RandomRangeMs);
+
+            long totalMs = (long)numHours.Value * 3600000L + (long)numMinutes.Value * 60000L + (long)numSeconds.Value * 1000L + (long)numMillis.Value;
+            if (totalMs < 10) totalMs = 10;
+            baseIntervalMs = totalMs;
+            seqPlayIndex = 0;
         }
 
         // Picks the next interval: the fixed base interval, or - when randomization is on - a
@@ -1560,6 +2018,7 @@ namespace AutoClickerApp
 
         void DoClick()
         {
+            if (chkDryRun.Checked) return; // dry run: cursor already moved, just skip the actual click
             uint down, up;
             switch (cmbButton.SelectedIndex)
             {
@@ -1573,6 +2032,7 @@ namespace AutoClickerApp
 
         void DoKeyPress(Keys key)
         {
+            if (chkDryRun.Checked) return; // dry run: never send real key presses either
             byte vk = (byte)key;
             keybd_event(vk, 0, 0, UIntPtr.Zero);
             keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
