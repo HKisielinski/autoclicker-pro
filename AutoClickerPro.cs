@@ -89,9 +89,25 @@ namespace AutoClickerApp
             public bool IsKey;
             public Point Position;
             public Keys Key;
+            // Wait time (ms) to use after THIS step fires, overriding the sequence's default
+            // interval. -1 means "no override — use the default interval".
+            public int CustomIntervalMs;
 
-            public static SequenceStep ForClick(Point p) { return new SequenceStep { IsKey = false, Position = p }; }
-            public static SequenceStep ForKey(Keys k) { return new SequenceStep { IsKey = true, Key = k }; }
+            public static SequenceStep ForClick(Point p) { return new SequenceStep { IsKey = false, Position = p, CustomIntervalMs = -1 }; }
+            public static SequenceStep ForKey(Keys k) { return new SequenceStep { IsKey = true, Key = k, CustomIntervalMs = -1 }; }
+        }
+
+        // A named saved sequence: its steps plus its own click-interval/randomize settings,
+        // so switching between saved sequences also switches to that sequence's own timing.
+        class SavedSequenceData
+        {
+            public List<SequenceStep> Steps = new List<SequenceStep>();
+            public int Hours;
+            public int Minutes;
+            public int Seconds = 1;
+            public int Millis;
+            public bool Randomize;
+            public int RandomRangeMs;
         }
 
         const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -127,8 +143,14 @@ namespace AutoClickerApp
         static string GumroadBuyUrl { get { return "https://gumroad.com/l/" + GUMROAD_PRODUCT_PERMALINK; } }
         const int TRIAL_CLICK_LIMIT = 100;
 
+        // When true, a build with no existing license.txt auto-grants full access for
+        // DEMO_DAYS days from first launch, no key required — used only for hand-distributed
+        // "let a friend try it" packages, never for the public GitHub/Gumroad/itch.io release.
+        const bool DEMO_BUILD = false;
+        const int DEMO_DAYS = 30;
+
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.0.3";
+        const string APP_VERSION = "1.0.5";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -141,6 +163,9 @@ namespace AutoClickerApp
         string licenseKey = "";
         int trialClicksUsed = 0;
         DateTime lastVerifiedUtc = DateTime.MinValue;
+        DateTime licenseExpiresUtc = DateTime.MinValue;
+        bool sequencesLoadFailed = false;
+        bool licenseLoadFailed = false;
 
         GroupBox grpLicense;
         Label lblLicenseStatus, lblPricing;
@@ -154,7 +179,7 @@ namespace AutoClickerApp
         NumericUpDown numX, numY;
         Button btnPickPos;
         ListBox lstSequence;
-        Button btnAddSeq, btnRemoveSeq, btnSeqUp, btnSeqDown, btnClearSeq, btnRecord;
+        Button btnAddSeq, btnRemoveSeq, btnSeqUp, btnSeqDown, btnClearSeq, btnDuplicateSeq, btnRecord, btnStepInterval;
         ComboBox cmbSavedSeq;
         Button btnSaveSeq, btnLoadSeq, btnDeleteSaved;
         ComboBox cmbButton;
@@ -171,7 +196,7 @@ namespace AutoClickerApp
         long baseIntervalMs;
         readonly Random rng = new Random();
 
-        Dictionary<string, List<SequenceStep>> savedSequences = new Dictionary<string, List<SequenceStep>>();
+        Dictionary<string, SavedSequenceData> savedSequences = new Dictionary<string, SavedSequenceData>();
         readonly string saveDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClickerPro");
         string SaveFile { get { return Path.Combine(saveDir, "sequences.txt"); } }
         string LicenseFile { get { return Path.Combine(saveDir, "license.txt"); } }
@@ -200,7 +225,7 @@ namespace AutoClickerApp
             MaximizeBox = false;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(340, 1065);
+            ClientSize = new Size(340, 1127);
             Font = new Font("Segoe UI", 9F);
 
             try
@@ -352,19 +377,23 @@ namespace AutoClickerApp
             Controls.Add(grpPos);
             y += 150;
 
-            var grpSeq = new GroupBox { Text = "Steps: clicks + key presses (in this order, looped)", Left = 10, Top = y, Width = 310, Height = 195 };
+            var grpSeq = new GroupBox { Text = "Steps: clicks + key presses (in this order, looped)", Left = 10, Top = y, Width = 310, Height = 257 };
             lstSequence = new ListBox { Left = 10, Top = 20, Width = 290, Height = 80 };
             btnAddSeq = new Button { Text = "Add position (3s)", Left = 10, Top = 105, Width = 140, Tag = "Add position (3s)" };
             btnRemoveSeq = new Button { Text = "Remove selected", Left = 160, Top = 105, Width = 140 };
             btnSeqUp = new Button { Text = "▲ Move up", Left = 10, Top = 132, Width = 90 };
             btnSeqDown = new Button { Text = "▼ Move down", Left = 110, Top = 132, Width = 90 };
             btnClearSeq = new Button { Text = "Clear", Left = 210, Top = 132, Width = 90 };
-            btnRecord = new Button { Text = "🔴 Record clicks + keys (F7)", Left = 10, Top = 161, Width = 290, Height = 26, Tag = "🔴 Record clicks + keys (F7)" };
+            btnDuplicateSeq = new Button { Text = "Duplicate selected", Left = 10, Top = 161, Width = 290, Height = 26 };
+            btnStepInterval = new Button { Text = "Set interval for selected step...", Left = 10, Top = 192, Width = 290, Height = 26 };
+            btnRecord = new Button { Text = "🔴 Record clicks + keys (F7)", Left = 10, Top = 223, Width = 290, Height = 26, Tag = "🔴 Record clicks + keys (F7)" };
             btnAddSeq.Click += (s, e) => StartPick(1, btnAddSeq);
             btnRemoveSeq.Click += BtnRemoveSeq_Click;
             btnSeqUp.Click += (s, e) => MoveSelected(-1);
             btnSeqDown.Click += (s, e) => MoveSelected(1);
             btnClearSeq.Click += (s, e) => { sequence.Clear(); RefreshSequenceList(); };
+            btnDuplicateSeq.Click += BtnDuplicateSeq_Click;
+            btnStepInterval.Click += BtnStepInterval_Click;
             btnRecord.Click += (s, e) => ToggleRecording();
             grpSeq.Controls.Add(lstSequence);
             grpSeq.Controls.Add(btnAddSeq);
@@ -372,9 +401,11 @@ namespace AutoClickerApp
             grpSeq.Controls.Add(btnSeqUp);
             grpSeq.Controls.Add(btnSeqDown);
             grpSeq.Controls.Add(btnClearSeq);
+            grpSeq.Controls.Add(btnDuplicateSeq);
+            grpSeq.Controls.Add(btnStepInterval);
             grpSeq.Controls.Add(btnRecord);
             Controls.Add(grpSeq);
-            y += 205;
+            y += 267;
 
             var grpSaved = new GroupBox { Text = "Saved Sequences", Left = 10, Top = y, Width = 310, Height = 90 };
             cmbSavedSeq = new ComboBox { Left = 10, Top = 20, Width = 290, DropDownStyle = ComboBoxStyle.DropDownList };
@@ -442,11 +473,11 @@ namespace AutoClickerApp
             lblHotkeyInfo = new Label { Text = "F6 = start/stop clicking, F7 = start/stop recording clicks + key presses (global). Closing the window (X) minimizes it to the system tray — right-click the tray icon to exit for good.", Left = 10, Top = y, Width = 310, Height = 55, ForeColor = Color.Gray, TextAlign = ContentAlignment.MiddleCenter };
             Controls.Add(lblHotkeyInfo);
 
-            chkStartWithWindows = new CheckBox { Text = "Start with Windows", Left = 10, Top = 990, Width = 310, Checked = IsStartupEnabled() };
+            chkStartWithWindows = new CheckBox { Text = "Start with Windows", Left = 10, Top = 1052, Width = 310, Checked = IsStartupEnabled() };
             chkStartWithWindows.CheckedChanged += (s, e) => SetStartupEnabled(chkStartWithWindows.Checked);
             Controls.Add(chkStartWithWindows);
 
-            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 1022, Width = 310, Height = 28 };
+            btnCheckUpdate = new Button { Text = "Check for Updates (v" + APP_VERSION + ")", Left = 10, Top = 1084, Width = 310, Height = 28 };
             btnCheckUpdate.Click += BtnCheckUpdate_Click;
             Controls.Add(btnCheckUpdate);
         }
@@ -500,6 +531,7 @@ namespace AutoClickerApp
                 string desc = step.IsKey
                     ? string.Format("{0}. Key: {1}", i + 1, step.Key)
                     : string.Format("{0}. Click ({1}, {2})", i + 1, step.Position.X, step.Position.Y);
+                if (step.CustomIntervalMs >= 0) desc += string.Format("  [wait {0}ms]", step.CustomIntervalMs);
                 lstSequence.Items.Add(desc);
             }
         }
@@ -511,6 +543,50 @@ namespace AutoClickerApp
             sequence.RemoveAt(idx);
             RefreshSequenceList();
             if (idx < lstSequence.Items.Count) lstSequence.SelectedIndex = idx;
+        }
+
+        void BtnDuplicateSeq_Click(object sender, EventArgs e)
+        {
+            int idx = lstSequence.SelectedIndex;
+            if (idx < 0) return;
+            SequenceStep copy = sequence[idx];
+            sequence.Insert(idx + 1, copy);
+            RefreshSequenceList();
+            lstSequence.SelectedIndex = idx + 1;
+        }
+
+        // Lets a single step wait a different amount of time than the sequence's default
+        // interval before the NEXT step fires. Leave blank or enter 0 to go back to the default.
+        void BtnStepInterval_Click(object sender, EventArgs e)
+        {
+            int idx = lstSequence.SelectedIndex;
+            if (idx < 0)
+            {
+                MessageBox.Show(this, "Select a step in the list first.", "No Step Selected",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            SequenceStep step = sequence[idx];
+            string current = step.CustomIntervalMs >= 0 ? step.CustomIntervalMs.ToString() : "";
+            string input = Interaction.InputBox(
+                "Wait time in milliseconds after this step, before the next one fires.\nLeave blank (or 0) to use the sequence's default interval.\n\n(\"Randomize interval, ±\" still applies on top of this value, if enabled.)",
+                "Set Step Interval", current);
+            input = (input ?? "").Trim();
+
+            int ms;
+            if (input.Length == 0 || (int.TryParse(input, out ms) && ms <= 0))
+                step.CustomIntervalMs = -1;
+            else if (int.TryParse(input, out ms))
+                step.CustomIntervalMs = ms;
+            else
+            {
+                MessageBox.Show(this, "Enter a whole number of milliseconds.", "Invalid Value",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            sequence[idx] = step;
+            RefreshSequenceList();
+            lstSequence.SelectedIndex = idx;
         }
 
         void MoveSelected(int dir)
@@ -676,18 +752,42 @@ namespace AutoClickerApp
             name = (name ?? "").Trim();
             if (name.Length == 0) return;
 
-            savedSequences[name] = new List<SequenceStep>(sequence);
+            savedSequences[name] = new SavedSequenceData
+            {
+                Steps = new List<SequenceStep>(sequence),
+                Hours = (int)numHours.Value,
+                Minutes = (int)numMinutes.Value,
+                Seconds = (int)numSeconds.Value,
+                Millis = (int)numMillis.Value,
+                Randomize = chkRandomize.Checked,
+                RandomRangeMs = (int)numRandomMs.Value
+            };
             SaveAllToFile();
             RefreshSavedCombo();
             cmbSavedSeq.SelectedItem = name;
         }
 
+        // Loading a saved sequence also loads its own click-interval/randomize settings into the
+        // UI, so each saved sequence remembers its own timing instead of sharing one global setting.
         void BtnLoadSeq_Click(object sender, EventArgs e)
         {
             string name = cmbSavedSeq.SelectedItem as string;
             if (name == null || !savedSequences.ContainsKey(name)) return;
-            sequence = new List<SequenceStep>(savedSequences[name]);
+            var data = savedSequences[name];
+            sequence = new List<SequenceStep>(data.Steps);
             RefreshSequenceList();
+
+            numHours.Value = Clamp(numHours, data.Hours);
+            numMinutes.Value = Clamp(numMinutes, data.Minutes);
+            numSeconds.Value = Clamp(numSeconds, data.Seconds);
+            numMillis.Value = Clamp(numMillis, data.Millis);
+            chkRandomize.Checked = data.Randomize;
+            numRandomMs.Value = Clamp(numRandomMs, data.RandomRangeMs);
+        }
+
+        static decimal Clamp(NumericUpDown control, int value)
+        {
+            return Math.Max(control.Minimum, Math.Min(control.Maximum, value));
         }
 
         void BtnDeleteSaved_Click(object sender, EventArgs e)
@@ -702,6 +802,21 @@ namespace AutoClickerApp
             RefreshSavedCombo();
         }
 
+        // A file that was just written by this same app (or is briefly locked by antivirus/
+        // indexing right after being touched) can throw a sharing-violation IOException for a
+        // few hundred ms. Retrying briefly avoids treating that as "no saved data" and silently
+        // falling back to an empty/trial state.
+        static string[] ReadAllLinesWithRetry(string path)
+        {
+            const int attempts = 5;
+            for (int i = 0; i < attempts - 1; i++)
+            {
+                try { return File.ReadAllLines(path); }
+                catch (IOException) { System.Threading.Thread.Sleep(150); }
+            }
+            return File.ReadAllLines(path);
+        }
+
         void LoadAllFromFile()
         {
             savedSequences.Clear();
@@ -709,39 +824,85 @@ namespace AutoClickerApp
             try
             {
                 string currentName = null;
-                List<SequenceStep> currentList = null;
-                foreach (var rawLine in File.ReadAllLines(SaveFile))
+                SavedSequenceData currentData = null;
+                foreach (var rawLine in ReadAllLinesWithRetry(SaveFile))
                 {
                     string line = rawLine.Trim();
                     if (line.Length == 0) continue;
                     if (line.StartsWith("#"))
                     {
                         currentName = line.Substring(1);
-                        currentList = new List<SequenceStep>();
-                        savedSequences[currentName] = currentList;
+                        currentData = new SavedSequenceData();
+                        savedSequences[currentName] = currentData;
                     }
-                    else if (currentList != null)
+                    else if (currentData != null)
                     {
                         string[] parts = line.Split(',');
                         int px, py, vk;
-                        if (parts.Length == 3 && parts[0] == "C" && int.TryParse(parts[1], out px) && int.TryParse(parts[2], out py))
-                            currentList.Add(SequenceStep.ForClick(new Point(px, py)));
+                        if (parts.Length == 7 && parts[0] == "I")
+                        {
+                            int h, m, s, ms, range;
+                            if (int.TryParse(parts[1], out h) && int.TryParse(parts[2], out m) && int.TryParse(parts[3], out s)
+                                && int.TryParse(parts[4], out ms) && int.TryParse(parts[6], out range))
+                            {
+                                currentData.Hours = h;
+                                currentData.Minutes = m;
+                                currentData.Seconds = s;
+                                currentData.Millis = ms;
+                                currentData.Randomize = parts[5] == "1";
+                                currentData.RandomRangeMs = range;
+                            }
+                        }
+                        else if (parts.Length == 4 && parts[0] == "C" && int.TryParse(parts[1], out px) && int.TryParse(parts[2], out py))
+                        {
+                            int customMs;
+                            if (int.TryParse(parts[3], out customMs))
+                            {
+                                var cs = SequenceStep.ForClick(new Point(px, py));
+                                cs.CustomIntervalMs = customMs;
+                                currentData.Steps.Add(cs);
+                            }
+                        }
+                        else if (parts.Length == 3 && parts[0] == "K" && int.TryParse(parts[1], out vk))
+                        {
+                            int customMs;
+                            if (int.TryParse(parts[2], out customMs))
+                            {
+                                var ks = SequenceStep.ForKey((Keys)vk);
+                                ks.CustomIntervalMs = customMs;
+                                currentData.Steps.Add(ks);
+                            }
+                        }
+                        else if (parts.Length == 3 && parts[0] == "C" && int.TryParse(parts[1], out px) && int.TryParse(parts[2], out py))
+                            currentData.Steps.Add(SequenceStep.ForClick(new Point(px, py)));
                         else if (parts.Length == 2 && parts[0] == "K" && int.TryParse(parts[1], out vk))
-                            currentList.Add(SequenceStep.ForKey((Keys)vk));
+                            currentData.Steps.Add(SequenceStep.ForKey((Keys)vk));
                         else if (parts.Length == 2 && int.TryParse(parts[0], out px) && int.TryParse(parts[1], out py))
                             // legacy format (pre-1.0.2 save files): plain "x,y" with no prefix
-                            currentList.Add(SequenceStep.ForClick(new Point(px, py)));
+                            currentData.Steps.Add(SequenceStep.ForClick(new Point(px, py)));
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // corrupted save file — ignore, start with an empty saved-sequence list
+                savedSequences.Clear();
+                sequencesLoadFailed = true;
+                MessageBox.Show("Could not read your saved sequences (the file may be locked or corrupted):\n\n" + ex.Message +
+                    "\n\nYour saved sequences were NOT deleted — close this app without saving anything, then try reopening it.",
+                    "Failed to Load Saved Sequences", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
         void SaveAllToFile()
         {
+            // Never let a load that failed (e.g. a transient file lock) turn into an overwrite
+            // of the real file with an empty/partial in-memory list.
+            if (sequencesLoadFailed)
+            {
+                MessageBox.Show(this, "Saving is disabled because your saved sequences failed to load earlier this session.\n\nRestart the app to try loading them again before saving.",
+                    "Save Blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             try
             {
                 Directory.CreateDirectory(saveDir);
@@ -750,10 +911,13 @@ namespace AutoClickerApp
                     foreach (var kv in savedSequences)
                     {
                         w.WriteLine("#" + kv.Key);
-                        foreach (var step in kv.Value)
+                        var data = kv.Value;
+                        w.WriteLine("I," + data.Hours + "," + data.Minutes + "," + data.Seconds + "," + data.Millis
+                            + "," + (data.Randomize ? "1" : "0") + "," + data.RandomRangeMs);
+                        foreach (var step in data.Steps)
                         {
-                            if (step.IsKey) w.WriteLine("K," + (int)step.Key);
-                            else w.WriteLine("C," + step.Position.X + "," + step.Position.Y);
+                            if (step.IsKey) w.WriteLine("K," + (int)step.Key + "," + step.CustomIntervalMs);
+                            else w.WriteLine("C," + step.Position.X + "," + step.Position.Y + "," + step.CustomIntervalMs);
                         }
                     }
                 }
@@ -772,10 +936,21 @@ namespace AutoClickerApp
             isLicensed = false;
             licenseKey = "";
             trialClicksUsed = 0;
-            if (!File.Exists(LicenseFile)) return;
+            licenseExpiresUtc = DateTime.MinValue;
+            if (!File.Exists(LicenseFile))
+            {
+                if (DEMO_BUILD)
+                {
+                    isLicensed = true;
+                    licenseKey = "DEMO-" + DEMO_DAYS + "DAY";
+                    licenseExpiresUtc = DateTime.UtcNow.AddDays(DEMO_DAYS);
+                    SaveLicenseState();
+                }
+                return;
+            }
             try
             {
-                foreach (var rawLine in File.ReadAllLines(LicenseFile))
+                foreach (var rawLine in ReadAllLinesWithRetry(LicenseFile))
                 {
                     string line = rawLine.Trim();
                     int eq = line.IndexOf('=');
@@ -790,16 +965,32 @@ namespace AutoClickerApp
                         long ticks;
                         if (long.TryParse(v, out ticks)) lastVerifiedUtc = new DateTime(ticks, DateTimeKind.Utc);
                     }
+                    else if (k == "expiresUtc")
+                    {
+                        long ticks;
+                        if (long.TryParse(v, out ticks) && ticks > 0) licenseExpiresUtc = new DateTime(ticks, DateTimeKind.Utc);
+                    }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // corrupted license file — fall back to trial mode
+                isLicensed = false;
+                licenseKey = "";
+                licenseLoadFailed = true;
+                MessageBox.Show("Could not read your license file (it may be locked or corrupted):\n\n" + ex.Message +
+                    "\n\nYour license was NOT deleted — close this app without entering a new key, then try reopening it.",
+                    "Failed to Load License", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+
+            if (isLicensed && licenseExpiresUtc != DateTime.MinValue && DateTime.UtcNow >= licenseExpiresUtc)
+                isLicensed = false;
         }
 
         void SaveLicenseState()
         {
+            // Never let a load that failed (e.g. a transient file lock) turn into an overwrite
+            // of the real license file with a reset-to-trial in-memory state.
+            if (licenseLoadFailed) return;
             try
             {
                 Directory.CreateDirectory(saveDir);
@@ -809,6 +1000,7 @@ namespace AutoClickerApp
                     w.WriteLine("key=" + licenseKey);
                     w.WriteLine("trialClicks=" + trialClicksUsed);
                     w.WriteLine("lastVerified=" + lastVerifiedUtc.Ticks);
+                    w.WriteLine("expiresUtc=" + licenseExpiresUtc.Ticks);
                 }
             }
             catch
@@ -821,9 +1013,18 @@ namespace AutoClickerApp
         {
             if (isLicensed)
             {
-                string masked = licenseKey.Length > 4 ? "•••• " + licenseKey.Substring(licenseKey.Length - 4) : licenseKey;
-                lblLicenseStatus.Text = "Subscription active — thank you! (key ending " + masked + ")";
-                lblLicenseStatus.ForeColor = Color.Green;
+                if (licenseExpiresUtc != DateTime.MinValue)
+                {
+                    int daysLeft = Math.Max(0, (int)Math.Ceiling((licenseExpiresUtc - DateTime.UtcNow).TotalDays));
+                    lblLicenseStatus.Text = "Demo — full access active (" + daysLeft + " day(s) left)";
+                    lblLicenseStatus.ForeColor = Color.DarkOrange;
+                }
+                else
+                {
+                    string masked = licenseKey.Length > 4 ? "•••• " + licenseKey.Substring(licenseKey.Length - 4) : licenseKey;
+                    lblLicenseStatus.Text = "Subscription active — thank you! (key ending " + masked + ")";
+                    lblLicenseStatus.ForeColor = Color.Green;
+                }
                 btnEnterKey.Text = "Change License Key";
                 lblPricing.Visible = false;
             }
@@ -877,6 +1078,8 @@ namespace AutoClickerApp
                 isLicensed = true;
                 licenseKey = key;
                 lastVerifiedUtc = DateTime.UtcNow;
+                licenseExpiresUtc = DateTime.MinValue;
+                licenseLoadFailed = false;
                 SaveLicenseState();
                 UpdateLicenseUi();
                 MessageBox.Show(this, "License activated successfully. Thank you for your subscription!",
@@ -1186,6 +1389,7 @@ namespace AutoClickerApp
             }
 
             string stepInfo = "";
+            int stepCustomIntervalMs = -1;
 
             if (radFixedPos.Checked)
             {
@@ -1199,6 +1403,7 @@ namespace AutoClickerApp
                 if (seqPlayIndex >= sequence.Count) seqPlayIndex = 0;
                 SequenceStep step = sequence[seqPlayIndex];
                 stepInfo = string.Format(" (step {0}/{1})", seqPlayIndex + 1, sequence.Count);
+                stepCustomIntervalMs = step.CustomIntervalMs;
                 seqPlayIndex = (seqPlayIndex + 1) % sequence.Count;
 
                 if (step.IsKey)
@@ -1227,7 +1432,7 @@ namespace AutoClickerApp
             lblCount.Text = "Actions performed: " + clicksDone;
             lblStatus.Text = "Status: RUNNING" + stepInfo;
 
-            clickTimer.Interval = ComputeIntervalMs();
+            clickTimer.Interval = stepCustomIntervalMs >= 0 ? ComputeIntervalMs(stepCustomIntervalMs) : ComputeIntervalMs();
 
             if (radCount.Checked && clicksDone >= numCount.Value)
             {
@@ -1239,12 +1444,19 @@ namespace AutoClickerApp
         // uniformly random value within ±numRandomMs of it (clamped so it never drops below 10ms).
         int ComputeIntervalMs()
         {
+            return ComputeIntervalMs(baseIntervalMs);
+        }
+
+        // Same as above, but randomizes around a per-step custom base instead of the sequence's
+        // default interval — so "Randomize interval, ±" still applies to a manually-set step time.
+        int ComputeIntervalMs(long customBaseMs)
+        {
             if (!chkRandomize.Checked || numRandomMs.Value <= 0)
-                return (int)Math.Min(baseIntervalMs, int.MaxValue);
+                return (int)Math.Min(customBaseMs, int.MaxValue);
 
             int range = (int)numRandomMs.Value;
-            long lo = Math.Max(10, baseIntervalMs - range);
-            long hi = Math.Min(int.MaxValue, baseIntervalMs + range);
+            long lo = Math.Max(10, customBaseMs - range);
+            long hi = Math.Min(int.MaxValue, customBaseMs + range);
             if (hi < lo) hi = lo;
             return rng.Next((int)lo, (int)hi + 1);
         }
