@@ -160,7 +160,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.1.1";
+        const string APP_VERSION = "1.1.2";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -529,7 +529,7 @@ namespace AutoClickerApp
             lblHotkeyInfo = new Label { Text = "F6 = start/stop clicking, F7 = start/stop recording clicks + key presses (global). Closing the window (X) minimizes it to the system tray — right-click the tray icon to exit for good.", Left = 10, Top = y, Width = 310, Height = 55, ForeColor = Color.Gray, TextAlign = ContentAlignment.MiddleCenter };
             Controls.Add(lblHotkeyInfo);
 
-            chkStartWithWindows = new CheckBox { Text = "Start with Windows", Left = 10, Top = 1052, Width = 310, Checked = IsStartupEnabled() };
+            chkStartWithWindows = new CheckBox { Text = "Start with Windows", Left = 10, Top = 1052, Width = 310, Checked = ResolveStartupEnabledWithMigration() };
             chkStartWithWindows.CheckedChanged += (s, e) => SetStartupEnabled(chkStartWithWindows.Checked);
             Controls.Add(chkStartWithWindows);
 
@@ -640,33 +640,69 @@ namespace AutoClickerApp
 
         // --- Start with Windows ---
 
+        // Uses a small launcher script in the per-user Startup folder instead of the
+        // HKCU...\Run registry key. schtasks/Task Scheduler was tried first but requires
+        // elevated rights this account doesn't have ("Access is denied", confirmed even
+        // with /rl limited). A WScript.Shell COM shortcut (.lnk) was tried next, but
+        // creating it via late-bound reflection *before* the form's message loop starts
+        // (still inside the constructor) hung the app indefinitely — likely the COM call
+        // needing message-pump reentrancy that isn't running yet. A plain text file needs
+        // neither elevation nor COM: a one-line .vbs that just launches the exe hidden.
+        // Startup-folder entries also need no special rights (it's just a file in the
+        // user's own AppData) and, unlike the Run key, are visible and manageable
+        // directly in Explorer (shell:startup) or Task Manager's Startup tab.
+        static string StartupScriptPath
+        {
+            get
+            {
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup),
+                    "AutoClickerPro.vbs");
+            }
+        }
+
         bool IsStartupEnabled()
         {
+            try { return File.Exists(StartupScriptPath); }
+            catch { return false; }
+        }
+
+        // One-time migration: earlier versions used a HKCU...\Run registry value for
+        // startup. If a user had that checked before and never touched it since, the
+        // startup script won't exist yet on first launch after this update — detect
+        // the old value and silently recreate the setting as a Startup-folder script.
+        bool ResolveStartupEnabledWithMigration()
+        {
+            if (IsStartupEnabled()) return true;
             try
             {
                 using (var key = Registry.CurrentUser.OpenSubKey(STARTUP_REGISTRY_KEY, false))
                 {
-                    if (key == null) return false;
-                    return !string.IsNullOrEmpty(key.GetValue(STARTUP_VALUE_NAME) as string);
+                    if (key != null && !string.IsNullOrEmpty(key.GetValue(STARTUP_VALUE_NAME) as string))
+                    {
+                        SetStartupEnabled(true);
+                        return true;
+                    }
                 }
             }
-            catch
-            {
-                return false;
-            }
+            catch { /* best-effort migration */ }
+            return false;
         }
 
         void SetStartupEnabled(bool enabled)
         {
             try
             {
-                using (var key = Registry.CurrentUser.OpenSubKey(STARTUP_REGISTRY_KEY, true))
+                if (enabled)
                 {
-                    if (key == null) return;
-                    if (enabled)
-                        key.SetValue(STARTUP_VALUE_NAME, "\"" + Application.ExecutablePath + "\"");
-                    else
-                        key.DeleteValue(STARTUP_VALUE_NAME, false);
+                    string exePath = Application.ExecutablePath;
+                    string script =
+                        "Set objShell = CreateObject(\"WScript.Shell\")\r\n" +
+                        "objShell.Run Chr(34) & \"" + exePath + "\" & Chr(34), 0, False\r\n";
+                    File.WriteAllText(StartupScriptPath, script);
+                }
+                else
+                {
+                    if (File.Exists(StartupScriptPath)) File.Delete(StartupScriptPath);
                 }
             }
             catch (Exception ex)
@@ -674,6 +710,18 @@ namespace AutoClickerApp
                 MessageBox.Show(this, "Could not update the Windows startup setting: " + ex.Message, "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+
+            // Clean up the legacy Run-key entry from older versions either way, so it
+            // can never cause a duplicate launch alongside the new startup script.
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(STARTUP_REGISTRY_KEY, true))
+                {
+                    if (key != null && key.GetValue(STARTUP_VALUE_NAME) != null)
+                        key.DeleteValue(STARTUP_VALUE_NAME, false);
+                }
+            }
+            catch { /* best-effort cleanup */ }
         }
 
         // --- Sequence: list editing ---
