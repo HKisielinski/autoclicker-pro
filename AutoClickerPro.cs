@@ -160,7 +160,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.1.4";
+        const string APP_VERSION = "1.1.5";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -177,6 +177,19 @@ namespace AutoClickerApp
         bool sequencesLoadFailed = false;
         bool licenseLoadFailed = false;
         bool isLifetimeLicense = false;
+
+        // Set when the quick startup check couldn't confirm the file exists — which is
+        // ambiguous between "genuinely no data yet" and "still locked by something like an
+        // antivirus scan". recoveryRetryTimer keeps quietly retrying in the background
+        // (see StartRecoveryRetryIfNeeded) until it either finds the real data or gives up
+        // after a long, generous window — without blocking the window from showing or
+        // freezing the UI thread the way waiting longer up front would.
+        bool sequencesFileNotFoundAtStartup = false;
+        bool licenseFileNotFoundAtStartup = false;
+        Timer recoveryRetryTimer;
+        int recoveryRetryCount = 0;
+        const int RECOVERY_RETRY_INTERVAL_MS = 5000;
+        const int RECOVERY_RETRY_MAX_ATTEMPTS = 120; // ~10 minutes at 5s apart
 
         GroupBox grpLicense;
         Label lblLicenseStatus, lblPricing;
@@ -295,6 +308,7 @@ namespace AutoClickerApp
             LoadLicenseState();
             UpdateLicenseUi();
             SetupTray();
+            StartRecoveryRetryIfNeeded();
 
             clickTimer = new Timer();
             clickTimer.Tick += ClickTimer_Tick;
@@ -1216,18 +1230,19 @@ namespace AutoClickerApp
         }
 
         // A file that was just written by this same app (or is briefly locked by antivirus/
-        // indexing right after being touched) can throw a sharing-violation IOException.
-        // Confirmed in the wild: Windows Defender can churn (platform update + repeated
-        // config-changed events) for well over a minute right around boot/autostart, which
-        // blew straight through an earlier, much shorter retry budget and produced a silent
-        // empty/trial-mode startup with the real data untouched on disk the whole time.
-        // 60 attempts x 500ms = up to 30s before giving up — a one-time cost, only ever paid
-        // during that kind of AV storm; the common case still succeeds on the first attempt.
-        const int IO_RETRY_ATTEMPTS = 60;
-        const int IO_RETRY_DELAY_MS = 500;
+        // indexing right after being touched) can throw a sharing-violation IOException for a
+        // few hundred ms. This quick retry is only meant to smooth over that — it deliberately
+        // does NOT try to outlast a real antivirus scan (those can run for many minutes; two
+        // earlier attempts at a longer fixed budget, 2.5s then 30s, both still lost the race and
+        // produced a silent empty/trial-mode startup with the real data untouched on disk the
+        // whole time). The actual fix for long AV stalls is StartRecoveryRetryIfNeeded below,
+        // which keeps retrying in the background for as long as it takes, without blocking the
+        // window from appearing or freezing the UI thread.
+        const int QUICK_RETRY_ATTEMPTS = 6;
+        const int QUICK_RETRY_DELAY_MS = 500;
         static string[] ReadAllLinesWithRetry(string path)
         {
-            for (int i = 0; i < IO_RETRY_ATTEMPTS - 1; i++)
+            for (int i = 0; i < QUICK_RETRY_ATTEMPTS - 1; i++)
             {
                 try
                 {
@@ -1238,7 +1253,7 @@ namespace AutoClickerApp
                 catch (IOException ex)
                 {
                     LogStartup("ReadAllLinesWithRetry(" + path + ") attempt " + (i + 1) + " failed: " + ex.Message);
-                    System.Threading.Thread.Sleep(IO_RETRY_DELAY_MS);
+                    System.Threading.Thread.Sleep(QUICK_RETRY_DELAY_MS);
                 }
             }
             return File.ReadAllLines(path);
@@ -1247,14 +1262,14 @@ namespace AutoClickerApp
         // Quiet, append-only forensic log for the startup load path — never shown to the user,
         // just so a future "why did my license/sequences look empty" report has hard evidence
         // instead of guesswork. Capped in size so it can't grow unbounded over months of use.
-        // Retries too: a silent failure here is exactly what left the *previous* recurrence of
-        // this bug with zero evidence to diagnose from.
+        // Retries too: a silent failure here is exactly what left an earlier recurrence of this
+        // bug with zero evidence to diagnose from.
         static readonly string LogFile = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClickerPro", "startup_log.txt");
         static void LogStartup(string message)
         {
             string line = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff") + "Z  " + message + Environment.NewLine;
-            for (int i = 0; i < IO_RETRY_ATTEMPTS; i++)
+            for (int i = 0; i < QUICK_RETRY_ATTEMPTS; i++)
             {
                 try
                 {
@@ -1267,31 +1282,80 @@ namespace AutoClickerApp
                 }
                 catch
                 {
-                    if (i < IO_RETRY_ATTEMPTS - 1) System.Threading.Thread.Sleep(IO_RETRY_DELAY_MS);
+                    if (i < QUICK_RETRY_ATTEMPTS - 1) System.Threading.Thread.Sleep(QUICK_RETRY_DELAY_MS);
                 }
             }
             // logging is best-effort only — give up quietly after exhausting retries
         }
 
         // File.Exists() swallows every error (locks, permission issues, transient access
-        // faults) and just returns false, indistinguishable from "genuinely missing". Right
-        // after boot or wake-from-sleep, AV/indexer activity can hold a lock on the whole
-        // AppData\AutoClickerPro folder for far longer than a quick check allows — confirmed:
-        // a real recurrence coincided with a multi-minute burst of Windows Defender activity
-        // (platform update + repeated config-changed events) right at autostart. Retry
-        // generously before trusting a "missing" result.
+        // faults) and just returns false, indistinguishable from "genuinely missing". A few
+        // quick retries smooth over a brief lock; anything longer is handled by the background
+        // recovery retry (see StartRecoveryRetryIfNeeded), not by waiting longer here.
         static bool FileExistsWithRetry(string path)
         {
-            for (int i = 0; i < IO_RETRY_ATTEMPTS; i++)
+            for (int i = 0; i < QUICK_RETRY_ATTEMPTS; i++)
             {
                 try
                 {
                     if (File.Exists(path)) return true;
                 }
                 catch { /* treat like a miss and retry below */ }
-                if (i < IO_RETRY_ATTEMPTS - 1) System.Threading.Thread.Sleep(IO_RETRY_DELAY_MS);
+                if (i < QUICK_RETRY_ATTEMPTS - 1) System.Threading.Thread.Sleep(QUICK_RETRY_DELAY_MS);
             }
             return false;
+        }
+
+        // Runs after the window is already up. If either file looked missing at startup, keep
+        // checking every few seconds — quietly, in the background — instead of either freezing
+        // the UI for a long fixed wait or giving up for the rest of the session after one short
+        // one. Whichever file(s) show up first get loaded and their part of the UI refreshed
+        // immediately; the timer only stops once both are resolved (found or given up on).
+        void StartRecoveryRetryIfNeeded()
+        {
+            if (!sequencesFileNotFoundAtStartup && !licenseFileNotFoundAtStartup) return;
+            LogStartup("StartRecoveryRetryIfNeeded: starting background retry (sequences=" +
+                sequencesFileNotFoundAtStartup + ", license=" + licenseFileNotFoundAtStartup + ")");
+            recoveryRetryTimer = new Timer();
+            recoveryRetryTimer.Interval = RECOVERY_RETRY_INTERVAL_MS;
+            recoveryRetryTimer.Tick += RecoveryRetryTimer_Tick;
+            recoveryRetryTimer.Start();
+        }
+
+        void RecoveryRetryTimer_Tick(object sender, EventArgs e)
+        {
+            recoveryRetryCount++;
+
+            if (sequencesFileNotFoundAtStartup && File.Exists(SaveFile))
+            {
+                LogStartup("RecoveryRetryTimer: SaveFile appeared on attempt " + recoveryRetryCount + ", reloading");
+                LoadAllFromFile();
+                RefreshSavedCombo();
+            }
+            if (licenseFileNotFoundAtStartup && File.Exists(LicenseFile))
+            {
+                LogStartup("RecoveryRetryTimer: LicenseFile appeared on attempt " + recoveryRetryCount + ", reloading");
+                LoadLicenseState();
+                UpdateLicenseUi();
+            }
+
+            if (!sequencesFileNotFoundAtStartup && !licenseFileNotFoundAtStartup)
+            {
+                LogStartup("RecoveryRetryTimer: recovered, stopping background retry");
+                recoveryRetryTimer.Stop();
+                recoveryRetryTimer.Dispose();
+                recoveryRetryTimer = null;
+                return;
+            }
+
+            if (recoveryRetryCount >= RECOVERY_RETRY_MAX_ATTEMPTS)
+            {
+                LogStartup("RecoveryRetryTimer: giving up after " + recoveryRetryCount + " attempts (sequences=" +
+                    sequencesFileNotFoundAtStartup + ", license=" + licenseFileNotFoundAtStartup + ")");
+                recoveryRetryTimer.Stop();
+                recoveryRetryTimer.Dispose();
+                recoveryRetryTimer = null;
+            }
         }
 
         void LoadAllFromFile()
@@ -1299,9 +1363,11 @@ namespace AutoClickerApp
             savedSequences.Clear();
             if (!FileExistsWithRetry(SaveFile))
             {
+                sequencesFileNotFoundAtStartup = true;
                 LogStartup("LoadAllFromFile: SaveFile does not exist at " + SaveFile);
                 return;
             }
+            sequencesFileNotFoundAtStartup = false;
             LogStartup("LoadAllFromFile: SaveFile exists, size=" + new FileInfo(SaveFile).Length + " bytes");
             try
             {
@@ -1452,6 +1518,7 @@ namespace AutoClickerApp
             isLifetimeLicense = false;
             if (!FileExistsWithRetry(LicenseFile))
             {
+                licenseFileNotFoundAtStartup = true;
                 LogStartup("LoadLicenseState: LicenseFile does not exist at " + LicenseFile);
                 if (DEMO_BUILD)
                 {
@@ -1462,6 +1529,7 @@ namespace AutoClickerApp
                 }
                 return;
             }
+            licenseFileNotFoundAtStartup = false;
             LogStartup("LoadLicenseState: LicenseFile exists, size=" + new FileInfo(LicenseFile).Length + " bytes");
             try
             {
