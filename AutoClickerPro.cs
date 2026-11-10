@@ -111,6 +111,23 @@ namespace AutoClickerApp
             public int Millis;
             public bool Randomize;
             public int RandomRangeMs;
+
+            // Everything else that shapes how this sequence plays. The Has* flags tell apart
+            // "never saved with these settings" (sequences saved by older versions - loading
+            // them leaves the current UI values alone) from "saved with these values".
+            public bool HasPlayOptions;
+            public int ButtonIndex;
+            public bool DoubleClick;
+            public bool LimitCount;
+            public int CountLimit = 10;
+
+            public bool HasAdvancedOptions;
+            public bool PixelWait;
+            public bool PixelPicked;
+            public int PixelX, PixelY, PixelR, PixelG, PixelB;
+            public int PixelTolerance = 20;
+            public bool FocusGate;
+            public string FocusTitle = "";
         }
 
         const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -160,7 +177,7 @@ namespace AutoClickerApp
         const int DEMO_DAYS = 30;
 
         // --- Updates (GitHub Releases) ---
-        const string APP_VERSION = "1.1.5";
+        const string APP_VERSION = "1.1.7";
         const string GITHUB_REPO = "HKisielinski/autoclicker-pro";
         Button btnCheckUpdate;
 
@@ -309,6 +326,14 @@ namespace AutoClickerApp
             UpdateLicenseUi();
             SetupTray();
             StartRecoveryRetryIfNeeded();
+            StartSelfHealTimer();
+
+            // The process has been seen disappearing with no Windows crash/logoff/shutdown event
+            // at all, so there was never any evidence of why. Record every way out (and keep the
+            // app alive through UI-thread exceptions instead of letting them end the process).
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => LogStartup("ProcessExit (PID=" + Process.GetCurrentProcess().Id + ")");
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => LogStartup("UnhandledException (terminating=" + e.IsTerminating + "): " + e.ExceptionObject);
+            Application.ThreadException += (s, e) => LogStartup("ThreadException (app kept running): " + e.Exception);
 
             clickTimer = new Timer();
             clickTimer.Tick += ClickTimer_Tick;
@@ -346,6 +371,9 @@ namespace AutoClickerApp
 
             FormClosing += (s, e) =>
             {
+                LogStartup("FormClosing: reason=" + e.CloseReason + ", allowExit=" + allowExit +
+                    ", mouseButtons=" + Control.MouseButtons + ", modifierKeys=" + Control.ModifierKeys +
+                    ", isForeground=" + (GetForegroundWindow() == Handle) + ", windowState=" + WindowState);
                 if (!allowExit)
                 {
                     e.Cancel = true;
@@ -1017,6 +1045,7 @@ namespace AutoClickerApp
                 Randomize = chkRandomize.Checked,
                 RandomRangeMs = (int)numRandomMs.Value
             };
+            CaptureOptionsInto(savedSequences[name]);
             SaveAllToFile();
             RefreshSavedCombo();
             cmbSavedSeq.SelectedItem = name;
@@ -1038,6 +1067,60 @@ namespace AutoClickerApp
             numMillis.Value = Clamp(numMillis, data.Millis);
             chkRandomize.Checked = data.Randomize;
             numRandomMs.Value = Clamp(numRandomMs, data.RandomRangeMs);
+            ApplyOptionsFrom(data, true);
+        }
+
+        // Snapshot every per-sequence setting that isn't a step or timing value, so "Save as..."
+        // stores the whole configuration the user is looking at, not just the steps.
+        void CaptureOptionsInto(SavedSequenceData d)
+        {
+            d.HasPlayOptions = true;
+            d.ButtonIndex = cmbButton.SelectedIndex;
+            d.DoubleClick = chkDouble.Checked;
+            d.LimitCount = radCount.Checked;
+            d.CountLimit = (int)numCount.Value;
+
+            d.HasAdvancedOptions = true;
+            d.PixelWait = chkPixelWait.Checked;
+            d.PixelPicked = pixelPicked;
+            d.PixelX = pixelTarget.X;
+            d.PixelY = pixelTarget.Y;
+            d.PixelR = pixelTargetColor.R;
+            d.PixelG = pixelTargetColor.G;
+            d.PixelB = pixelTargetColor.B;
+            d.PixelTolerance = (int)numPixelTolerance.Value;
+            d.FocusGate = chkFocusGate.Checked;
+            d.FocusTitle = txtFocusTitle.Text.Trim();
+        }
+
+        // Counterpart of CaptureOptionsInto. Sequences saved by older versions have no stored
+        // options, in which case the current UI values are deliberately left untouched.
+        // includeCount is false for playlist playback: the click-count limit is one running
+        // total across the whole playlist, so it must not be swapped mid-run when the next
+        // sequence in the chain takes over.
+        void ApplyOptionsFrom(SavedSequenceData d, bool includeCount)
+        {
+            if (d.HasPlayOptions)
+            {
+                cmbButton.SelectedIndex = Math.Max(0, Math.Min(cmbButton.Items.Count - 1, d.ButtonIndex));
+                chkDouble.Checked = d.DoubleClick;
+                if (includeCount)
+                {
+                    if (d.LimitCount) radCount.Checked = true; else radInfinite.Checked = true;
+                    numCount.Value = Clamp(numCount, d.CountLimit);
+                }
+            }
+            if (d.HasAdvancedOptions)
+            {
+                chkPixelWait.Checked = d.PixelWait;
+                pixelTarget = new Point(d.PixelX, d.PixelY);
+                pixelTargetColor = Color.FromArgb(d.PixelR, d.PixelG, d.PixelB);
+                pixelPicked = d.PixelPicked;
+                numPixelTolerance.Value = Clamp(numPixelTolerance, d.PixelTolerance);
+                UpdatePixelInfoLabel();
+                chkFocusGate.Checked = d.FocusGate;
+                txtFocusTitle.Text = d.FocusTitle ?? "";
+            }
         }
 
         static decimal Clamp(NumericUpDown control, int value)
@@ -1358,6 +1441,63 @@ namespace AutoClickerApp
             }
         }
 
+        // Cause-independent safety net. The startup retry above only covers "file looked missing";
+        // a recurrence in the field (v1.1.5, trial mode + empty list, no log line at all, data
+        // fine on disk) showed the in-memory state can end up wrong for reasons we never
+        // observed. So instead of guessing the cause again, periodically compare memory against
+        // disk and heal any mismatch: memory says trial/empty, disk clearly has a license /
+        // sequences, and no load failure is being deliberately held. Read-only, never writes,
+        // no Sleep (a locked file just means "try again next tick"), capped so it can't loop.
+        Timer selfHealTimer;
+        int selfHealLicenseReloads = 0, selfHealSequenceReloads = 0;
+        const int SELF_HEAL_INTERVAL_MS = 30000;
+        const int SELF_HEAL_MAX_RELOADS = 10;
+
+        void StartSelfHealTimer()
+        {
+            selfHealTimer = new Timer();
+            selfHealTimer.Interval = SELF_HEAL_INTERVAL_MS;
+            selfHealTimer.Tick += SelfHealTimer_Tick;
+            selfHealTimer.Start();
+        }
+
+        void SelfHealTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (!isLicensed && !licenseLoadFailed && selfHealLicenseReloads < SELF_HEAL_MAX_RELOADS && File.Exists(LicenseFile))
+                {
+                    bool diskSaysLicensed = false;
+                    foreach (var line in File.ReadAllLines(LicenseFile))
+                        if (line.Trim() == "licensed=1") { diskSaysLicensed = true; break; }
+                    if (diskSaysLicensed)
+                    {
+                        selfHealLicenseReloads++;
+                        LogStartup("SelfHeal: memory says trial but license.txt says licensed=1 - reloading (#" + selfHealLicenseReloads + ")");
+                        LoadLicenseState();
+                        UpdateLicenseUi();
+                    }
+                }
+                if (savedSequences.Count == 0 && !sequencesLoadFailed && selfHealSequenceReloads < SELF_HEAL_MAX_RELOADS && File.Exists(SaveFile))
+                {
+                    bool diskHasSequences = false;
+                    foreach (var line in File.ReadAllLines(SaveFile))
+                        if (line.StartsWith("#")) { diskHasSequences = true; break; }
+                    if (diskHasSequences)
+                    {
+                        selfHealSequenceReloads++;
+                        LogStartup("SelfHeal: saved list is empty but sequences.txt has data - reloading (#" + selfHealSequenceReloads + ")");
+                        LoadAllFromFile();
+                        RefreshSavedCombo();
+                    }
+                }
+            }
+            catch
+            {
+                // locked or mid-write — just try again on the next tick
+            }
+        }
+
         void LoadAllFromFile()
         {
             savedSequences.Clear();
@@ -1399,6 +1539,34 @@ namespace AutoClickerApp
                                 currentData.Millis = ms;
                                 currentData.Randomize = parts[5] == "1";
                                 currentData.RandomRangeMs = range;
+                            }
+                        }
+                        else if (parts.Length == 5 && parts[0] == "O")
+                        {
+                            int btn, cnt;
+                            if (int.TryParse(parts[1], out btn) && int.TryParse(parts[4], out cnt))
+                            {
+                                currentData.HasPlayOptions = true;
+                                currentData.ButtonIndex = btn;
+                                currentData.DoubleClick = parts[2] == "1";
+                                currentData.LimitCount = parts[3] == "1";
+                                currentData.CountLimit = cnt;
+                            }
+                        }
+                        else if (parts.Length >= 10 && parts[0] == "A")
+                        {
+                            int ax, ay, ar, ag, ab, atol;
+                            if (int.TryParse(parts[2], out ax) && int.TryParse(parts[3], out ay) && int.TryParse(parts[4], out ar)
+                                && int.TryParse(parts[5], out ag) && int.TryParse(parts[6], out ab) && int.TryParse(parts[7], out atol))
+                            {
+                                currentData.HasAdvancedOptions = true;
+                                currentData.PixelWait = parts[1] == "1";
+                                currentData.PixelX = ax; currentData.PixelY = ay;
+                                currentData.PixelR = ar; currentData.PixelG = ag; currentData.PixelB = ab;
+                                currentData.PixelTolerance = atol;
+                                currentData.PixelPicked = parts[8] == "1";
+                                currentData.FocusGate = parts[9] == "1";
+                                currentData.FocusTitle = string.Join(",", parts, 10, parts.Length - 10);
                             }
                         }
                         else if (parts.Length == 4 && parts[0] == "C" && int.TryParse(parts[1], out px) && int.TryParse(parts[2], out py))
@@ -1465,6 +1633,15 @@ namespace AutoClickerApp
                         var data = kv.Value;
                         w.WriteLine("I," + data.Hours + "," + data.Minutes + "," + data.Seconds + "," + data.Millis
                             + "," + (data.Randomize ? "1" : "0") + "," + data.RandomRangeMs);
+                        // O = play options (button, double click, click-count limit)
+                        if (data.HasPlayOptions)
+                            w.WriteLine("O," + data.ButtonIndex + "," + (data.DoubleClick ? "1" : "0") + ","
+                                + (data.LimitCount ? "1" : "0") + "," + data.CountLimit);
+                        // A = advanced options (wait-for-pixel, focus lock). Title goes last since it may contain commas.
+                        if (data.HasAdvancedOptions)
+                            w.WriteLine("A," + (data.PixelWait ? "1" : "0") + "," + data.PixelX + "," + data.PixelY + ","
+                                + data.PixelR + "," + data.PixelG + "," + data.PixelB + "," + data.PixelTolerance + ","
+                                + (data.PixelPicked ? "1" : "0") + "," + (data.FocusGate ? "1" : "0") + "," + (data.FocusTitle ?? ""));
                         foreach (var step in data.Steps)
                         {
                             if (step.IsKey) w.WriteLine("K," + (int)step.Key + "," + step.CustomIntervalMs);
@@ -2141,6 +2318,7 @@ namespace AutoClickerApp
             numMillis.Value = Clamp(numMillis, data.Millis);
             chkRandomize.Checked = data.Randomize;
             numRandomMs.Value = Clamp(numRandomMs, data.RandomRangeMs);
+            ApplyOptionsFrom(data, false);
 
             long totalMs = (long)numHours.Value * 3600000L + (long)numMinutes.Value * 60000L + (long)numSeconds.Value * 1000L + (long)numMillis.Value;
             if (totalMs < 10) totalMs = 10;
